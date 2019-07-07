@@ -52,7 +52,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 
-#include <ofi_osd.h>
+#include <ofi_mem.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -324,7 +324,7 @@ static int pp_ctrl_init_client(struct ct_pingpong *ct)
 	struct sockaddr_in in_addr = {0};
 	struct addrinfo *results;
 	struct addrinfo *rp;
-	int errno_save;
+	int errno_save = 0;
 	int ret;
 
 	ret = pp_getaddrinfo(ct->opts.dst_addr, ct->opts.dst_port, &results);
@@ -1298,11 +1298,10 @@ static int pp_alloc_msgs(struct ct_pingpong *ct)
 		       MAX(ct->rx_size, PP_MAX_CTRL_MSG) +
 		       ct->tx_prefix_size + ct->rx_prefix_size;
 
-	alignment = ofi_sysconf(_SC_PAGESIZE);
+	alignment = ofi_get_page_size();
 	if (alignment < 0) {
-		ret = -ofi_sockerr();
-		PP_PRINTERR("ofi_sysconf", ret);
-		return ret;
+		PP_PRINTERR("ofi_get_page_size", alignment);
+		return alignment;
 	}
 	/* Extra alignment for the second part of the buffer */
 	ct->buf_size += alignment;
@@ -1854,6 +1853,7 @@ static int pp_finalize(struct ct_pingpong *ct)
 	struct iovec iov;
 	int ret;
 	struct fi_context ctx[2];
+	void *mem_desc[1] = { fi_mr_desc(ct->mr) };
 	const char *fin_buf = "fin";
 	const size_t fin_buf_size = strlen(fin_buf) + 1;
 
@@ -1869,7 +1869,7 @@ static int pp_finalize(struct ct_pingpong *ct)
 		struct fi_msg msg = {
 			.msg_iov = &iov,
 			.iov_count = 1,
-			.desc = fi_mr_desc(ct->mr),
+			.desc = mem_desc,
 			.addr = ct->remote_fi_addr,
 			.context = ctx,
 		};
@@ -1883,7 +1883,7 @@ static int pp_finalize(struct ct_pingpong *ct)
 		struct fi_msg_tagged tmsg = {
 			.msg_iov = &iov,
 			.iov_count = 1,
-			.desc = fi_mr_desc(ct->mr),
+			.desc = mem_desc,
 			.addr = ct->remote_fi_addr,
 			.context = ctx,
 			.tag = TAG,
@@ -2143,6 +2143,8 @@ static int run_pingpong_dgram(struct ct_pingpong *ct)
 	 */
 	ret = fi_recv(ct->ep, ct->rx_buf, ct->rx_size, fi_mr_desc(ct->mr), 0,
 		      ct->rx_ctx_ptr);
+	if (ret)
+		return ret;
 
 	ret = run_suite_pingpong(ct);
 	if (ret)

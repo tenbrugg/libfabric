@@ -136,6 +136,12 @@ features of libfabric.
 *fi_unexpected_msg*
 : Tests the send and receive handling of unexpected tagged messages.
 
+*fi_unmap_mem*
+: Tests data transfers where the transmit buffer is mmapped and
+  unmapped between each transfer, but the virtual address of the transmit
+  buffer tries to remain the same.  This test is used to validate the
+  correct behavior of memory registration caches.
+
 # Benchmarks
 
 The client and the server exchange messages in either a ping-pong manner,
@@ -220,6 +226,14 @@ provider.  Example test configurations are at /test_configs.
   For example, if there are 8 test variables, with 6 having 2 possible
   values and 2 having 3 possible values, ubertest will execute 576 total
   iterations of each test.
+
+### Config file options
+
+TODO: add all supported config options
+
+- *threading*
+  Specify a list of threading levels. This is a hints only config: ubertest
+  doesn't spawn multiple threads to verify functionality.
 
 # HOW TO RUN TESTS
 

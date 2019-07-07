@@ -77,7 +77,7 @@ extern "C" {
 #endif
 
 #define FI_MAJOR_VERSION 1
-#define FI_MINOR_VERSION 7
+#define FI_MINOR_VERSION 8
 
 enum {
 	FI_PATH_MAX		= 256,
@@ -201,6 +201,7 @@ enum {
 	FI_ADDR_STR,		/* formatted char * */
 	FI_ADDR_PSMX2,		/* uint64_t[2] */
 	FI_ADDR_IB_UD,		/* uint64_t[4] */
+	FI_ADDR_EFA,
 };
 
 #define FI_ADDR_UNSPEC		((uint64_t) -1)
@@ -262,6 +263,16 @@ enum fi_resource_mgmt {
 #define FI_ORDER_SAW		(1ULL << 7)
 #define FI_ORDER_SAS		(1ULL << 8)
 #define FI_ORDER_STRICT		0x1FF
+
+#define FI_ORDER_RMA_RAR	(1ULL << 32)
+#define FI_ORDER_RMA_RAW	(1ULL << 33)
+#define FI_ORDER_RMA_WAR	(1ULL << 34)
+#define FI_ORDER_RMA_WAW	(1ULL << 35)
+#define FI_ORDER_ATOMIC_RAR	(1ULL << 36)
+#define FI_ORDER_ATOMIC_RAW	(1ULL << 37)
+#define FI_ORDER_ATOMIC_WAR	(1ULL << 38)
+#define FI_ORDER_ATOMIC_WAW	(1ULL << 39)
+
 #define FI_ORDER_DATA		(1ULL << 16)
 
 enum fi_ep_type {
@@ -301,6 +312,7 @@ enum {
 	FI_PROTO_MRAIL,
 	FI_PROTO_RSTREAM,
 	FI_PROTO_RDMA_CM_IB_XRC,
+	FI_PROTO_EFA
 };
 
 /* Mode bits */
@@ -540,7 +552,7 @@ struct fid_nic {
 };
 
 #define FI_CHECK_OP(ops, opstype, op) \
-	((ops->size > offsetof(opstype, op)) && ops->op)
+	(ops && (ops->size > offsetof(opstype, op)) && ops->op)
 
 static inline int fi_close(struct fid *fid)
 {

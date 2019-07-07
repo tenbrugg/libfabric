@@ -748,7 +748,7 @@ static int sock_pe_process_rx_read(struct sock_pe *pe,
 					pe_entry->pe.rx.rx_iov[i].iov.len,
 					FI_REMOTE_READ);
 		if (!mr) {
-			SOCK_LOG_ERROR("Remote memory access error: %p, %lu, %" PRIu64 "\n",
+			SOCK_LOG_ERROR("Remote memory access error: %p, %zu, %" PRIu64 "\n",
 				       (void *) (uintptr_t) pe_entry->pe.rx.rx_iov[i].iov.addr,
 				       pe_entry->pe.rx.rx_iov[i].iov.len,
 				       pe_entry->pe.rx.rx_iov[i].iov.key);
@@ -802,7 +802,7 @@ static int sock_pe_process_rx_write(struct sock_pe *pe,
 					pe_entry->pe.rx.rx_iov[i].iov.len,
 					FI_REMOTE_WRITE);
 		if (!mr) {
-			SOCK_LOG_ERROR("Remote memory access error: %p, %lu, %" PRIu64 "\n",
+			SOCK_LOG_ERROR("Remote memory access error: %p, %zu, %" PRIu64 "\n",
 				       (void *) (uintptr_t) pe_entry->pe.rx.rx_iov[i].iov.addr,
 				       pe_entry->pe.rx.rx_iov[i].iov.len,
 				       pe_entry->pe.rx.rx_iov[i].iov.key);
@@ -958,7 +958,7 @@ static int sock_pe_process_rx_atomic(struct sock_pe *pe,
 					pe_entry->pe.rx.rx_iov[i].ioc.count * datatype_sz,
 					FI_REMOTE_WRITE);
 		if (!mr) {
-			SOCK_LOG_ERROR("Remote memory access error: %p, %lu, %" PRIu64 "\n",
+			SOCK_LOG_ERROR("Remote memory access error: %p, %zu, %" PRIu64 "\n",
 				       (void *) (uintptr_t) pe_entry->pe.rx.rx_iov[i].ioc.addr,
 				       pe_entry->pe.rx.rx_iov[i].ioc.count * datatype_sz,
 				       pe_entry->pe.rx.rx_iov[i].ioc.key);
@@ -2699,14 +2699,14 @@ struct sock_pe *sock_pe_init(struct sock_domain *domain)
 
 	
 	ret = ofi_bufpool_create(&pe->pe_rx_pool,
-				 sizeof(struct sock_pe_entry), 16, 0, 1024);
+				 sizeof(struct sock_pe_entry), 16, 0, 1024, 0);
 	if (ret) {
 		SOCK_LOG_ERROR("failed to create buffer pool\n");
 		goto err1;
 	}
 
 	ret = ofi_bufpool_create(&pe->atomic_rx_pool,
-				 SOCK_EP_MAX_ATOMIC_SZ, 16, 0, 32);
+				 SOCK_EP_MAX_ATOMIC_SZ, 16, 0, 32, 0);
 	if (ret) {
 		SOCK_LOG_ERROR("failed to create atomic rx buffer pool\n");
 		goto err2;

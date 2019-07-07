@@ -163,6 +163,7 @@ fi_ibv_alloc_init_ep(struct fi_info *info, struct fi_ibv_domain *domain,
 		xrc_ep = calloc(1, sizeof(*xrc_ep));
 		if (!xrc_ep)
 			return NULL;
+		xrc_ep->magic = VERBS_XRC_EP_MAGIC;
 		ep = &xrc_ep->base_ep;
 	} else {
 		ep = calloc(1, sizeof(*ep));
@@ -221,14 +222,16 @@ static int fi_ibv_close_free_ep(struct fi_ibv_ep *ep)
 	return 0;
 }
 
+/* Caller must hold eq:lock */
 static inline void fi_ibv_ep_xrc_close(struct fi_ibv_ep *ep)
 {
 	struct fi_ibv_xrc_ep *xrc_ep = container_of(ep, struct fi_ibv_xrc_ep,
 						    base_ep);
 
 	if (xrc_ep->conn_setup)
-		fi_ibv_free_xrc_conn_setup(xrc_ep);
+		fi_ibv_free_xrc_conn_setup(xrc_ep, 0);
 	fi_ibv_ep_destroy_xrc_qp(xrc_ep);
+	xrc_ep->magic = 0;
 }
 
 static int fi_ibv_ep_close(fid_t fid)
@@ -240,10 +243,16 @@ static int fi_ibv_ep_close(fid_t fid)
 
 	switch (ep->util_ep.type) {
 	case FI_EP_MSG:
+		if (ep->eq)
+			fastlock_acquire(&ep->eq->lock);
+
 		if (fi_ibv_is_xrc(ep->info))
 			fi_ibv_ep_xrc_close(ep);
 		else
 			rdma_destroy_ep(ep->id);
+
+		if (ep->eq)
+			fastlock_release(&ep->eq->lock);
 		fi_ibv_cleanup_cq(ep);
 		break;
 	case FI_EP_DGRAM:
@@ -414,7 +423,7 @@ static int fi_ibv_create_dgram_ep(struct fi_ibv_domain *domain, struct fi_ibv_ep
 		}
 	}
 
-	if (ibv_query_gid(domain->verbs, 1, 0, &gid)) {
+	if (ibv_query_gid(domain->verbs, 1, fi_ibv_gl_data.gid_idx, &gid)) {
 		VERBS_WARN(FI_LOG_EP_CTRL,
 			   "Unable to query GID, errno = %d",
 			   errno);
@@ -710,7 +719,7 @@ static int fi_ibv_dgram_ep_setname(fid_t ep_fid, void *addr, size_t addrlen)
 
 	if (addrlen < ep->info->src_addrlen) {
 		VERBS_INFO(FI_LOG_EP_CTRL,
-			   "addrlen expected: %"PRIu64", got: %"PRIu64"\n",
+			   "addrlen expected: %zu, got: %zu\n",
 			   ep->info->src_addrlen, addrlen);
 		return -FI_ETOOSMALL;
 	}
@@ -749,7 +758,7 @@ static int fi_ibv_dgram_ep_getname(fid_t ep_fid, void *addr, size_t *addrlen)
 	if (*addrlen < sizeof(ep->ep_name)) {
 		*addrlen = sizeof(ep->ep_name);
 		VERBS_INFO(FI_LOG_EP_CTRL,
-			   "addrlen expected: %"PRIu64", got: %"PRIu64"\n",
+			   "addrlen expected: %zu, got: %zu\n",
 			   sizeof(ep->ep_name), *addrlen);
 		return -FI_ETOOSMALL;
 	}

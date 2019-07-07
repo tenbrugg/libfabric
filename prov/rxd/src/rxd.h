@@ -61,7 +61,7 @@
 
 #define RXD_MAJOR_VERSION 	(1)
 #define RXD_MINOR_VERSION 	(0)
-#define RXD_PROTOCOL_VERSION 	(1)
+#define RXD_PROTOCOL_VERSION 	(2)
 
 #define RXD_MAX_MTU_SIZE	4096
 
@@ -85,7 +85,6 @@
 #define RXD_TAG_HDR		(1 << 4)
 #define RXD_INLINE		(1 << 5)
 #define RXD_MULTI_RECV		(1 << 6)
-#define RXD_CANCELLED		(1 << 7)
 
 struct rxd_env {
 	int spin_count;
@@ -118,7 +117,6 @@ struct rxd_domain {
 	ssize_t max_inline_rma;
 	ssize_t max_inline_atom;
 	ssize_t max_seg_sz;
-	int mr_mode;
 	struct ofi_mr_map mr_map;//TODO use util_domain mr_map instead
 };
 
@@ -139,6 +137,7 @@ struct rxd_peer {
 	uint16_t curr_rx_id;
 	uint16_t curr_tx_id;
 
+	struct rxd_unexp_msg *curr_unexp;
 	struct dlist_entry tx_list;
 	struct dlist_entry rx_list;
 	struct dlist_entry rma_rx_list;
@@ -187,7 +186,6 @@ struct rxd_ep {
 	int do_local_mr;
 	int next_retry;
 	int dg_cq_fd;
-	size_t pending_cnt;
 	uint32_t tx_flags;
 	uint32_t rx_flags;
 
@@ -297,6 +295,18 @@ struct rxd_pkt_entry {
 	void *pkt;
 };
 
+struct rxd_unexp_msg {
+	struct dlist_entry entry;
+	struct rxd_pkt_entry *pkt_entry;
+	struct dlist_entry pkt_list;
+	struct rxd_base_hdr *base_hdr;
+	struct rxd_sar_hdr *sar_hdr;
+	struct rxd_tag_hdr *tag_hdr;
+	struct rxd_data_hdr *data_hdr;
+	size_t msg_size;
+	void *msg;
+};
+
 static inline int rxd_pkt_type(struct rxd_pkt_entry *pkt_entry)
 {
 	return ((struct rxd_base_hdr *) (pkt_entry->pkt))->type;
@@ -326,14 +336,6 @@ static inline struct rxd_sar_hdr *rxd_get_sar_hdr(struct rxd_pkt_entry *pkt_entr
 		sizeof(struct rxd_base_hdr));
 }
 
-static inline struct rxd_tag_hdr *rxd_get_tag_hdr(struct rxd_pkt_entry *pkt_entry)
-{
-	struct rxd_base_hdr *hdr = rxd_get_base_hdr(pkt_entry);
-	
-	return (struct rxd_tag_hdr *) ((char *) hdr + sizeof(*hdr) +
-		(hdr->flags & RXD_INLINE ? 0 : sizeof(struct rxd_sar_hdr)));
-}
-
 static inline void rxd_set_tx_pkt(struct rxd_ep *ep, struct rxd_pkt_entry *pkt_entry)
 {
 	pkt_entry->pkt = (void *) ((char *) pkt_entry +
@@ -354,6 +356,7 @@ static inline void *rxd_pkt_start(struct rxd_pkt_entry *pkt_entry)
 struct rxd_match_attr {
 	fi_addr_t	peer;
 	uint64_t	tag;
+	uint64_t	ignore;
 };
 
 static inline int rxd_match_addr(fi_addr_t addr, fi_addr_t match_addr)
@@ -403,23 +406,34 @@ ssize_t rxd_ep_post_data_pkts(struct rxd_ep *ep, struct rxd_x_entry *tx_entry);
 void rxd_insert_unacked(struct rxd_ep *ep, fi_addr_t peer,
 			struct rxd_pkt_entry *pkt_entry);
 ssize_t rxd_send_rts_if_needed(struct rxd_ep *rxd_ep, fi_addr_t rxd_addr);
-int rxd_ep_send_op(struct rxd_ep *rxd_ep, struct rxd_x_entry *tx_entry,
-		   const struct fi_rma_iov *rma_iov, size_t rma_count,
-		   const struct iovec *comp_iov, size_t comp_count,
-		   enum fi_datatype datatype, enum fi_op atomic_op);
+int rxd_start_xfer(struct rxd_ep *ep, struct rxd_x_entry *tx_entry);
 void rxd_init_data_pkt(struct rxd_ep *ep, struct rxd_x_entry *tx_entry,
 		       struct rxd_pkt_entry *pkt_entry);
-void rxd_unpack_hdrs(size_t pkt_size, struct rxd_base_hdr *base_hdr,
-		     struct rxd_sar_hdr **sar_hdr, struct rxd_tag_hdr **tag_hdr,
-		     struct rxd_data_hdr **data_hdr, struct rxd_rma_hdr **rma_hdr,
-		     struct rxd_atom_hdr **atom_hdr, void **msg, size_t *msg_size);
+void rxd_init_base_hdr(struct rxd_ep *rxd_ep, void **ptr,
+		       struct rxd_x_entry *tx_entry);
+void rxd_init_sar_hdr(void **ptr, struct rxd_x_entry *tx_entry,
+		      size_t iov_count);
+void rxd_init_tag_hdr(void **ptr, struct rxd_x_entry *tx_entry);
+void rxd_init_data_hdr(void **ptr, struct rxd_x_entry *tx_entry);
+void rxd_init_rma_hdr(void **ptr, const struct fi_rma_iov *rma_iov,
+		      size_t rma_count);
+void rxd_init_atom_hdr(void **ptr, enum fi_datatype datatype,
+		       enum fi_op atomic_op);
+size_t rxd_init_msg(void **ptr, const struct iovec *iov, size_t iov_count,
+		    size_t total_len, size_t avail_len);
+static inline void rxd_check_init_cq_data(void **ptr, struct rxd_x_entry *tx_entry,
+			      		  size_t *max_inline)
+{	
+	if (tx_entry->flags & RXD_REMOTE_CQ_DATA) {
+		rxd_init_data_hdr(ptr, tx_entry);
+		*max_inline -= sizeof(tx_entry->cq_entry.data);
+	}
+}
 
 /* Tx/Rx entry sub-functions */
-struct rxd_x_entry *rxd_tx_entry_init(struct rxd_ep *ep, const struct iovec *iov,
-				      size_t iov_count, const struct iovec *res_iov,
-				      size_t res_count, size_t rma_count,
-				      uint64_t data, uint64_t tag, void *context,
-				      fi_addr_t addr, uint32_t op, uint32_t flags);
+struct rxd_x_entry *rxd_tx_entry_init_common(struct rxd_ep *ep, fi_addr_t addr,
+			uint32_t op, const struct iovec *iov, size_t iov_count,
+			uint64_t tag, uint64_t data, uint32_t flags, void *context);
 struct rxd_x_entry *rxd_rx_entry_init(struct rxd_ep *ep,
 			const struct iovec *iov, size_t iov_count, uint64_t tag,
 			uint64_t ignore, void *context, fi_addr_t addr,
@@ -433,7 +447,7 @@ uint64_t rxd_get_retry_time(uint64_t start, uint8_t retry_cnt);
 ssize_t rxd_ep_generic_recvmsg(struct rxd_ep *rxd_ep, const struct iovec *iov,
 			       size_t iov_count, fi_addr_t addr, uint64_t tag,
 			       uint64_t ignore, void *context, uint32_t op,
-			       uint32_t rxd_flags);
+			       uint32_t rxd_flags, uint64_t flags);
 ssize_t rxd_ep_generic_sendmsg(struct rxd_ep *rxd_ep, const struct iovec *iov,
 			       size_t iov_count, fi_addr_t addr, uint64_t tag,
 			       uint64_t data, void *context, uint32_t op,
@@ -457,10 +471,13 @@ void rxd_progress_op(struct rxd_ep *ep, struct rxd_x_entry *rx_entry,
 		     struct rxd_rma_hdr *rma_hdr,
 		     struct rxd_atom_hdr *atom_hdr,
 		     void **msg, size_t size);
+void rxd_ep_recv_data(struct rxd_ep *ep, struct rxd_x_entry *x_entry,
+		      struct rxd_data_pkt *pkt, size_t size);
 void rxd_progress_tx_list(struct rxd_ep *ep, struct rxd_peer *peer);
 struct rxd_x_entry *rxd_progress_multi_recv(struct rxd_ep *ep,
 					    struct rxd_x_entry *rx_entry,
 					    size_t total_size);
+void rxd_ep_progress(struct util_ep *util_ep);
 
 /* CQ sub-functions */
 void rxd_cq_report_error(struct rxd_cq *cq, struct fi_cq_err_entry *err_entry);

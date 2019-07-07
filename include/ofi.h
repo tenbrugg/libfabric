@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
  * Copyright (c) 2016-2018 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2019 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -67,6 +68,15 @@ extern "C" {
 #define OFI_GETINFO_INTERNAL	(1ULL << 58)
 #define OFI_CORE_PROV_ONLY	(1ULL << 59)
 
+#define OFI_ORDER_RAR_SET	(FI_ORDER_RAR | FI_ORDER_RMA_RAR | \
+				 FI_ORDER_ATOMIC_RAR)
+#define OFI_ORDER_RAW_SET	(FI_ORDER_RAW | FI_ORDER_RMA_RAW | \
+				 FI_ORDER_ATOMIC_RAW)
+#define OFI_ORDER_WAR_SET	(FI_ORDER_WAR | FI_ORDER_RMA_WAR | \
+				 FI_ORDER_ATOMIC_WAR)
+#define OFI_ORDER_WAW_SET	(FI_ORDER_WAW | FI_ORDER_RMA_WAW | \
+				 FI_ORDER_ATOMIC_WAW)
+
 #define sizeof_field(type, field) sizeof(((type *)0)->field)
 
 #ifndef MIN
@@ -86,6 +96,26 @@ extern "C" {
 #define ofi_div_ceil(a, b) ((a + b - 1) / b)
 
 #define OFI_MAGIC_64 (0x0F1C0DE0F1C0DE64)
+
+#ifndef BIT
+#define BIT(nr) (1UL << (nr))
+#endif
+
+#ifndef BIT_ULL
+#define BIT_ULL(nr) (1ULL << (nr))
+#endif
+
+#ifndef GENMASK
+#define GENMASK(h, l) (((1U << ((h) - (l) + 1)) - 1) << (l))
+#endif
+
+#ifndef GENMASK_ULL
+#define GENMASK_ULL(h, l) (((~0ULL) << (l)) & (~0ULL >> (64 - 1 - (h))))
+#endif
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 #define TAB "    "
 
@@ -175,10 +205,27 @@ static inline uint64_t roundup_power_of_two(uint64_t n)
 	return n;
 }
 
-static inline size_t fi_get_aligned_sz(size_t size, size_t alignment)
+static inline size_t ofi_get_aligned_size(size_t size, size_t alignment)
 {
 	return ((size % alignment) == 0) ?
 		size : ((size / alignment) + 1) * alignment;
+}
+
+static inline void *ofi_get_page_start(const void *addr, size_t page_size)
+{
+	return (void *)((uintptr_t) addr & ~(page_size - 1));
+}
+
+static inline void *ofi_get_page_end(const void *addr, size_t page_size)
+{
+	return ofi_get_page_start((const char *) addr + page_size -1, page_size);
+}
+
+static inline size_t
+ofi_get_page_bytes(const void *addr, size_t len, size_t page_size)
+{
+	return (char *)ofi_get_page_end((const char *) addr + len, page_size) -
+	       (char *)ofi_get_page_start(addr, page_size);
 }
 
 #define FI_TAG_GENERIC	0xAAAAAAAAAAAAAAAAULL
@@ -200,8 +247,21 @@ int ofi_check_rx_mode(const struct fi_info *info, uint64_t flags);
 uint64_t fi_gettime_ms(void);
 uint64_t fi_gettime_us(void);
 
+static inline uint64_t ofi_timeout_time(int timeout)
+{
+	return (timeout >= 0) ? fi_gettime_ms() + timeout : 0;
+}
+
+static inline int ofi_adjust_timeout(uint64_t timeout_time, int *timeout)
+{
+	if (*timeout >= 0) {
+		*timeout = (int) (timeout_time - fi_gettime_ms());
+		return (*timeout <= 0) ? -FI_ETIMEDOUT : 0;
+	}
+	return 0;
+}
+
 #define OFI_ENUM_VAL(X) X
-#define OFI_ENUM_VAL_EX(X, VAL) X = VAL
 #define OFI_STR(X) #X
 #define OFI_STR_INT(X) OFI_STR(X)
 

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2016-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2017 Intel Corporation, Inc.  All rights reserved.
+ * Copyright (c) 2017-2019 Intel Corporation, Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -37,26 +37,34 @@
 #include <ofi_iov.h>
 #include <ofi_mr.h>
 #include <ofi_list.h>
+#include <ofi_tree.h>
 
-static int util_mr_find_within(void *a, void *b)
+
+struct ofi_mr_cache_params cache_params = {
+	.max_cnt = 1024,
+};
+
+static int util_mr_find_within(struct ofi_rbmap *map, void *key, void *data)
 {
-	struct iovec *iov1 = a, *iov2 = b;
+	struct ofi_mr_entry *entry = data;
+	struct iovec *iov = key;
 
-	if (ofi_iov_shifted_left(iov1, iov2))
+	if (ofi_iov_shifted_left(iov, &entry->iov))
 		return -1;
-	else if (ofi_iov_shifted_right(iov1, iov2))
+	else if (ofi_iov_shifted_right(iov, &entry->iov))
 		return 1;
 	else
 		return 0;
 }
 
-static int util_mr_find_overlap(void *a, void *b)
+static int util_mr_find_overlap(struct ofi_rbmap *map, void *key, void *data)
 {
-	struct iovec *iov1 = a, *iov2 = b;
+	struct ofi_mr_entry *entry = data;
+	struct iovec *iov = key;
 
-	if (ofi_iov_left(iov1, iov2))
+	if (ofi_iov_left(iov, &entry->iov))
 		return -1;
-	else if (ofi_iov_right(iov1, iov2))
+	else if (ofi_iov_right(iov, &entry->iov))
 		return 1;
 	else
 		return 0;
@@ -69,16 +77,18 @@ static void util_mr_free_entry(struct ofi_mr_cache *cache,
 	       entry->iov.iov_base, entry->iov.iov_len);
 
 	assert(!entry->cached);
-	if (entry->subscribed) {
-		ofi_monitor_unsubscribe(&entry->subscription);
+	/* If regions are not being merged, then we can't safely
+	 * unsubscribe this region from the monitor.  Otherwise, we
+	 * might unsubscribe an address range in use by another region.
+	 * As a result, we remain subscribed.  This may result in extra
+	 * notification events, but is harmless to correct operation.
+	 */
+	if (entry->subscribed && cache_params.merge_regions) {
+		ofi_monitor_unsubscribe(cache->monitor, entry->iov.iov_base,
+					entry->iov.iov_len);
 		entry->subscribed = 0;
 	}
 	cache->delete_region(cache, entry);
-	assert((cache->cached_cnt != 0) &&
-	       (((ssize_t)cache->cached_size - (ssize_t)entry->iov.iov_len) >= 0));
-	cache->cached_cnt--;
-	cache->cached_size -= entry->iov.iov_len;
-	
 	ofi_buf_free(entry);
 }
 
@@ -86,30 +96,40 @@ static void util_mr_uncache_entry(struct ofi_mr_cache *cache,
 				  struct ofi_mr_entry *entry)
 {
 	assert(entry->cached);
-	cache->mr_storage.erase(&cache->mr_storage, entry);
+	cache->storage.erase(&cache->storage, entry);
 	entry->cached = 0;
+	cache->cached_cnt--;
+	cache->cached_size -= entry->iov.iov_len;
 }
 
-static void
-util_mr_cache_process_events(struct ofi_mr_cache *cache)
+/* Caller must hold ofi_mem_monitor lock */
+void ofi_mr_cache_notify(struct ofi_mr_cache *cache, const void *addr, size_t len)
 {
-	struct ofi_subscription *subscription;
 	struct ofi_mr_entry *entry;
+	struct iovec iov;
 
-	while ((subscription = ofi_monitor_get_event(&cache->nq))) {
-		entry = container_of(subscription, struct ofi_mr_entry,
-				     subscription);
-		if (entry->cached)
-			util_mr_uncache_entry(cache, entry);
+	cache->notify_cnt++;
+	iov.iov_base = (void *) addr;
+	iov.iov_len = len;
+
+	for (entry = cache->storage.overlap(&cache->storage, &iov); entry;
+	     entry = cache->storage.overlap(&cache->storage, &iov)) {
+		util_mr_uncache_entry(cache, entry);
 
 		if (entry->use_cnt == 0) {
 			dlist_remove_init(&entry->lru_entry);
 			util_mr_free_entry(cache, entry);
 		}
 	}
+
+	/* See comment in util_mr_free_entry.  If we're not merging address
+	 * ranges, we can only safely unsubscribe for the reported range.
+	 */
+	if (!cache_params.merge_regions)
+		ofi_monitor_unsubscribe(cache->monitor, addr, len);
 }
 
-bool ofi_mr_cache_flush(struct ofi_mr_cache *cache)
+static bool mr_cache_flush(struct ofi_mr_cache *cache)
 {
 	struct ofi_mr_entry *entry;
 
@@ -127,21 +147,34 @@ bool ofi_mr_cache_flush(struct ofi_mr_cache *cache)
 	return true;
 }
 
+bool ofi_mr_cache_flush(struct ofi_mr_cache *cache)
+{
+	bool empty;
+
+	fastlock_acquire(&cache->monitor->lock);
+	empty = mr_cache_flush(cache);
+	fastlock_release(&cache->monitor->lock);
+	return empty;
+}
+
 void ofi_mr_cache_delete(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
 {
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "delete %p (len: %" PRIu64 ")\n",
 	       entry->iov.iov_base, entry->iov.iov_len);
-	cache->delete_cnt++;
 
-	util_mr_cache_process_events(cache);
+	fastlock_acquire(&cache->monitor->lock);
+	cache->delete_cnt++;
 
 	if (--entry->use_cnt == 0) {
 		if (entry->cached) {
 			dlist_insert_tail(&entry->lru_entry, &cache->lru_list);
 		} else {
+			cache->uncached_cnt--;
+			cache->uncached_size -= entry->iov.iov_len;
 			util_mr_free_entry(cache, entry);
 		}
 	}
+	fastlock_release(&cache->monitor->lock);
 }
 
 static int
@@ -153,8 +186,6 @@ util_mr_cache_create(struct ofi_mr_cache *cache, const struct iovec *iov,
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "create %p (len: %" PRIu64 ")\n",
 	       iov->iov_base, iov->iov_len);
 
-	util_mr_cache_process_events(cache);
-
 	*entry = ofi_buf_alloc(cache->entry_pool);
 	if (OFI_UNLIKELY(!*entry))
 		return -FI_ENOMEM;
@@ -164,33 +195,37 @@ util_mr_cache_create(struct ofi_mr_cache *cache, const struct iovec *iov,
 
 	ret = cache->add_region(cache, *entry);
 	if (ret) {
-		while (ret && ofi_mr_cache_flush(cache)) {
+		while (ret && mr_cache_flush(cache)) {
 			ret = cache->add_region(cache, *entry);
 		}
 		if (ret) {
-			assert(!ofi_mr_cache_flush(cache));
+			assert(!mr_cache_flush(cache));
 			ofi_buf_free(*entry);
 			return ret;
 		}
 	}
 
-	cache->cached_size += iov->iov_len;
-	if ((++cache->cached_cnt > cache->max_cached_cnt) ||
-	    (cache->cached_size > cache->max_cached_size)) {
+	if ((cache->cached_cnt > cache_params.max_cnt) ||
+	    (cache->cached_size > cache_params.max_size)) {
 		(*entry)->cached = 0;
+		cache->uncached_cnt++;
+		cache->uncached_size += iov->iov_len;
 	} else {
-		if (cache->mr_storage.insert(&cache->mr_storage,
-					     &(*entry)->iov, *entry)) {
+		if (cache->storage.insert(&cache->storage,
+					  &(*entry)->iov, *entry)) {
 			ret = -FI_ENOMEM;
 			goto err;
 		}
 		(*entry)->cached = 1;
+		cache->cached_cnt++;
+		cache->cached_size += iov->iov_len;
 
-		ret = ofi_monitor_subscribe(&cache->nq, iov->iov_base, iov->iov_len,
-					    &(*entry)->subscription);
+		ret = ofi_monitor_subscribe(cache->monitor, iov->iov_base,
+					    iov->iov_len);
 		if (ret)
-			goto err;
-		(*entry)->subscribed = 1;
+			util_mr_uncache_entry(cache, *entry);
+		else
+			(*entry)->subscribed = 1;
 	}
 
 	return 0;
@@ -215,27 +250,23 @@ util_mr_cache_merge(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 		old_iov = &old_entry->iov;
 
 		iov.iov_len = ((uintptr_t)
-			MAX(ofi_iov_end(&iov), ofi_iov_end(old_iov))) -
+			MAX(ofi_iov_end(&iov), ofi_iov_end(old_iov))) + 1 -
 			((uintptr_t) MIN(iov.iov_base, old_iov->iov_base));
 		iov.iov_base = MIN(iov.iov_base, old_iov->iov_base);
 		FI_DBG(cache->domain->prov, FI_LOG_MR, "merged %p (len: %" PRIu64 ")\n",
 		       iov.iov_base, iov.iov_len);
 
-		if (old_entry->subscribed) {
-			/* old entry will be removed as soon as `use_cnt == 0`.
-			 * unsubscribe from the entry */
-			ofi_monitor_unsubscribe(&old_entry->subscription);
-			old_entry->subscribed = 0;
-		}
-		cache->mr_storage.erase(&cache->mr_storage, old_entry);
-		old_entry->cached = 0;
+		/* New entry will expand range of subscription */
+		old_entry->subscribed = 0;
+
+		util_mr_uncache_entry(cache, old_entry);
 
 		if (old_entry->use_cnt == 0) {
 			dlist_remove_init(&old_entry->lru_entry);
 			util_mr_free_entry(cache, old_entry); 
 		}
 
-	} while ((old_entry = cache->mr_storage.find(&cache->mr_storage, &iov)));
+	} while ((old_entry = cache->storage.find(&cache->storage, &iov)));
 
 	return util_mr_cache_create(cache, &iov, attr->access, entry);
 }
@@ -243,33 +274,40 @@ util_mr_cache_merge(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 int ofi_mr_cache_search(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 			struct ofi_mr_entry **entry)
 {
-	util_mr_cache_process_events(cache);
+	int ret = 0;
 
 	assert(attr->iov_count == 1);
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "search %p (len: %" PRIu64 ")\n",
 	       attr->mr_iov->iov_base, attr->mr_iov->iov_len);
+
+	fastlock_acquire(&cache->monitor->lock);
 	cache->search_cnt++;
 
-	while (((cache->cached_cnt >= cache->max_cached_cnt) ||
-		(cache->cached_size >= cache->max_cached_size)) &&
-	       ofi_mr_cache_flush(cache))
+	while (((cache->cached_cnt >= cache_params.max_cnt) ||
+		(cache->cached_size >= cache_params.max_size)) &&
+	       mr_cache_flush(cache))
 		;
 
-	*entry = cache->mr_storage.find(&cache->mr_storage, attr->mr_iov);
+	*entry = cache->storage.find(&cache->storage, attr->mr_iov);
 	if (!*entry) {
-		return util_mr_cache_create(cache, attr->mr_iov,
-					    attr->access, entry);
+		ret = util_mr_cache_create(cache, attr->mr_iov,
+					   attr->access, entry);
+		goto unlock;
 	}
 
 	/* This branch is always false if the merging entries wasn't requested */
-	if (!ofi_iov_within(attr->mr_iov, &(*entry)->iov))
-		return util_mr_cache_merge(cache, attr, *entry, entry);
+	if (!ofi_iov_within(attr->mr_iov, &(*entry)->iov)) {
+		ret = util_mr_cache_merge(cache, attr, *entry, entry);
+		goto unlock;
+	}
 
 	cache->hit_cnt++;
 	if ((*entry)->use_cnt++ == 0)
 		dlist_remove_init(&(*entry)->lru_entry);
 
-	return 0;
+unlock:
+	fastlock_release(&cache->monitor->lock);
+	return ret;
 }
 
 void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache)
@@ -277,12 +315,16 @@ void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache)
 	struct ofi_mr_entry *entry;
 	struct dlist_entry *tmp;
 
+	/* If we don't have a domain, initialization failed */
+	if (!cache->domain)
+		return;
+
 	FI_INFO(cache->domain->prov, FI_LOG_MR, "MR cache stats: "
-		"searches %zu, deletes %zu, hits %zu\n",
-		cache->search_cnt, cache->delete_cnt, cache->hit_cnt);
+		"searches %zu, deletes %zu, hits %zu notify %zu\n",
+		cache->search_cnt, cache->delete_cnt, cache->hit_cnt,
+		cache->notify_cnt);
 
-	util_mr_cache_process_events(cache);
-
+	fastlock_acquire(&cache->monitor->lock);
 	dlist_foreach_container_safe(&cache->lru_list, struct ofi_mr_entry,
 				     entry, lru_entry, tmp) {
 		assert(entry->use_cnt == 0);
@@ -290,87 +332,104 @@ void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache)
 		dlist_remove_init(&entry->lru_entry);
 		util_mr_free_entry(cache, entry);
 	}
-	cache->mr_storage.destroy(&cache->mr_storage);
-	ofi_monitor_del_queue(&cache->nq);
+	fastlock_release(&cache->monitor->lock);
+
+	ofi_monitor_del_cache(cache);
+	cache->storage.destroy(&cache->storage);
 	ofi_atomic_dec32(&cache->domain->ref);
 	ofi_bufpool_destroy(cache->entry_pool);
 	assert(cache->cached_cnt == 0);
 	assert(cache->cached_size == 0);
+	assert(cache->uncached_cnt == 0);
+	assert(cache->uncached_size == 0);
 }
 
-static void ofi_mr_rbt_storage_destroy(struct ofi_mr_storage *storage)
+static void ofi_mr_rbt_destroy(struct ofi_mr_storage *storage)
 {
-	rbtDelete((RbtHandle)storage->storage);
+	ofi_rbmap_destroy(storage->storage);
 }
 
-static struct ofi_mr_entry *ofi_mr_rbt_storage_find(struct ofi_mr_storage *storage,
-						    const struct iovec *key)
+static struct ofi_mr_entry *ofi_mr_rbt_find(struct ofi_mr_storage *storage,
+					    const struct iovec *key)
 {
-	struct ofi_mr_entry *entry;
-	RbtIterator iter = rbtFind((RbtHandle)storage->storage, (void *)key);
-	if (OFI_UNLIKELY(!iter))
-		return iter;
+	struct ofi_rbnode *node;
 
-	rbtKeyValue(storage->storage, iter, (void *)&key, (void *)&entry);
-	return entry;
+	node = ofi_rbmap_find(storage->storage, (void *) key);
+	if (!node)
+		return NULL;
+
+	return node->data;
 }
 
-static int ofi_mr_rbt_storage_insert(struct ofi_mr_storage *storage,
-				     struct iovec *key,
-				     struct ofi_mr_entry *entry)
+static struct ofi_mr_entry *ofi_mr_rbt_overlap(struct ofi_mr_storage *storage,
+					    const struct iovec *key)
 {
-	int ret = rbtInsert((RbtHandle)storage->storage,
-			    (void *)&entry->iov, (void *)entry);
-	if (ret != RBT_STATUS_OK) {
-		switch (ret) {
-		case RBT_STATUS_MEM_EXHAUSTED:
-			return -FI_ENOMEM;
-		case RBT_STATUS_DUPLICATE_KEY:
-			return -FI_EALREADY;
-		default:
-			return -FI_EAVAIL;
-		}
-	}
-	return ret;
+	struct ofi_rbnode *node;
+
+	node = ofi_rbmap_search(storage->storage, (void *) key,
+				util_mr_find_overlap);
+	if (!node)
+		return NULL;
+
+	return node->data;
 }
 
-static int ofi_mr_rbt_storage_erase(struct ofi_mr_storage *storage,
-				    struct ofi_mr_entry *entry)
+static int ofi_mr_rbt_insert(struct ofi_mr_storage *storage,
+			     struct iovec *key,
+			     struct ofi_mr_entry *entry)
 {
-	RbtIterator iter = rbtFind(storage->storage, &entry->iov);
-	assert(iter);
-	return (rbtErase((RbtHandle)storage->storage, iter) != RBT_STATUS_OK) ?
-	       -FI_EAVAIL : 0;
+	return ofi_rbmap_insert(storage->storage, (void *) &entry->iov,
+			        (void *) entry);
 }
 
-static int ofi_mr_cache_init_rbt_storage(struct ofi_mr_cache *cache)
+static int ofi_mr_rbt_erase(struct ofi_mr_storage *storage,
+			    struct ofi_mr_entry *entry)
 {
-	cache->mr_storage.storage = rbtNew(cache->merge_regions ?
-					   util_mr_find_overlap :
-					   util_mr_find_within);
-	if (!cache->mr_storage.storage)
+	struct ofi_rbnode *node;
+
+	node = ofi_rbmap_find(storage->storage, &entry->iov);
+	assert(node);
+	ofi_rbmap_delete(storage->storage, node);
+	return 0;
+}
+
+static int ofi_mr_cache_init_rbt(struct ofi_mr_cache *cache)
+{
+	cache->storage.storage = ofi_rbmap_create(cache_params.merge_regions ?
+						  util_mr_find_overlap :
+						  util_mr_find_within);
+	if (!cache->storage.storage)
 		return -FI_ENOMEM;
-	cache->mr_storage.destroy = ofi_mr_rbt_storage_destroy;
-	cache->mr_storage.find = ofi_mr_rbt_storage_find;
-	cache->mr_storage.insert = ofi_mr_rbt_storage_insert;
-	cache->mr_storage.erase = ofi_mr_rbt_storage_erase;
+
+	cache->storage.overlap = ofi_mr_rbt_overlap;
+	cache->storage.destroy = ofi_mr_rbt_destroy;
+	cache->storage.find = ofi_mr_rbt_find;
+	cache->storage.insert = ofi_mr_rbt_insert;
+	cache->storage.erase = ofi_mr_rbt_erase;
 	return 0;
 }
 
 static int ofi_mr_cache_init_storage(struct ofi_mr_cache *cache)
 {
-	switch (cache->mr_storage.type) {
+	int ret;
+
+	switch (cache->storage.type) {
 	case OFI_MR_STORAGE_DEFAULT:
 	case OFI_MR_STORAGE_RBT:
-		return ofi_mr_cache_init_rbt_storage(cache);
+		ret = ofi_mr_cache_init_rbt(cache);
+		break;
 	case OFI_MR_STORAGE_USER:
-		if (!(cache->mr_storage.storage &&
-		      cache->mr_storage.destroy && cache->mr_storage.find &&
-		      cache->mr_storage.insert && cache->mr_storage.erase))
-			return -FI_EINVAL;
+		ret = (cache->storage.storage && cache->storage.overlap &&
+		      cache->storage.destroy && cache->storage.find &&
+		      cache->storage.insert && cache->storage.erase) ?
+			0 : -FI_EINVAL;
+		break;
+	default:
+		ret = -FI_EINVAL;
 		break;
 	}
-	return 0;
+
+	return ret;
 }
 
 int ofi_mr_cache_init(struct util_domain *domain,
@@ -378,36 +437,45 @@ int ofi_mr_cache_init(struct util_domain *domain,
 		      struct ofi_mr_cache *cache)
 {
 	int ret;
+
 	assert(cache->add_region && cache->delete_region);
-
-	ret = ofi_mr_cache_init_storage(cache);
-	if (ret)
-		return ret;
-
-	cache->domain = domain;
-	ofi_atomic_inc32(&domain->ref);
+	if (!cache_params.max_cnt)
+		return -FI_ENOSPC;
 
 	dlist_init(&cache->lru_list);
 	cache->cached_cnt = 0;
 	cache->cached_size = 0;
-	if (!cache->max_cached_size)
-		cache->max_cached_size = SIZE_MAX;
+	cache->uncached_cnt = 0;
+	cache->uncached_size = 0;
 	cache->search_cnt = 0;
 	cache->delete_cnt = 0;
 	cache->hit_cnt = 0;
-	ofi_monitor_add_queue(monitor, &cache->nq);
+	cache->notify_cnt = 0;
+	cache->domain = domain;
+	ofi_atomic_inc32(&domain->ref);
+
+	ret = ofi_mr_cache_init_storage(cache);
+	if (ret)
+		goto dec;
+
+	ret = ofi_monitor_add_cache(monitor, cache);
+	if (ret)
+		goto destroy;
 
 	ret = ofi_bufpool_create(&cache->entry_pool,
-				   sizeof(struct ofi_mr_entry) +
-				   cache->entry_data_size,
-				   16, 0, cache->max_cached_cnt);
+				 sizeof(struct ofi_mr_entry) +
+				 cache->entry_data_size,
+				 16, 0, 0, 0);
 	if (ret)
-		goto err;
+		goto del;
 
 	return 0;
-err:
+del:
+	ofi_monitor_del_cache(cache);
+destroy:
+	cache->storage.destroy(&cache->storage);
+dec:
 	ofi_atomic_dec32(&cache->domain->ref);
-	ofi_monitor_del_queue(&cache->nq);
-	cache->mr_storage.destroy(&cache->mr_storage);
+	cache->domain = NULL;
 	return ret;
 }

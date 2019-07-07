@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2015-2017 Intel Corporation, Inc.  All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2019 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -75,6 +76,19 @@ extern "C" {
 #define UTIL_FLAG_OVERFLOW	(1ULL << 61)
 
 #define OFI_CNTR_ENABLED	(1ULL << 61)
+
+#define OFI_Q_STRERROR(prov, level, subsys, q, q_str, entry, q_strerror)	\
+	FI_LOG(prov, level, subsys, "fi_" q_str "_readerr: err: %s (%d), "	\
+	       "prov_err: %s (%d)\n", strerror((entry)->err), (entry)->err,	\
+	       q_strerror((q), -(entry)->prov_errno,				\
+			  (entry)->err_data, NULL, 0),				\
+	       -(entry)->prov_errno)
+
+#define OFI_CQ_STRERROR(prov, level, subsys, cq, entry) \
+	OFI_Q_STRERROR(prov, level, subsys, cq, "cq", entry, fi_cq_strerror)
+
+#define OFI_EQ_STRERROR(prov, level, subsys, eq, entry) \
+	OFI_Q_STRERROR(prov, level, subsys, eq, "eq", entry, fi_eq_strerror)
 
 #define FI_INFO_FIELD(provider, prov_attr, user_attr, prov_str, user_str, type)	\
 	do {										\
@@ -284,6 +298,13 @@ int ofi_endpoint_init(struct fid_domain *domain, const struct util_prov *util_pr
 		      ofi_ep_progress_func progress);
 
 int ofi_endpoint_close(struct util_ep *util_ep);
+
+static inline int
+ofi_ep_fid_bind(struct fid *ep_fid, struct fid *bfid, uint64_t flags)
+{
+	return ofi_ep_bind(container_of(ep_fid, struct util_ep, ep_fid.fid),
+			   bfid, flags);
+}
 
 static inline void ofi_ep_lock_acquire(struct util_ep *ep)
 {
@@ -639,6 +660,7 @@ struct util_av {
 	size_t			count;
 	size_t			addrlen;
 	struct dlist_entry	ep_list;
+	fastlock_t		ep_list_lock;
 };
 
 struct util_av_attr {
@@ -659,6 +681,7 @@ int ofi_av_close_lightweight(struct util_av *av);
 
 int ofi_av_insert_addr(struct util_av *av, const void *addr, fi_addr_t *fi_addr);
 int ofi_av_remove_addr(struct util_av *av, fi_addr_t fi_addr);
+fi_addr_t ofi_av_lookup_fi_addr_unsafe(struct util_av *av, const void *addr);
 fi_addr_t ofi_av_lookup_fi_addr(struct util_av *av, const void *addr);
 int ofi_av_elements_iter(struct util_av *av, ofi_av_apply_func apply, void *arg);
 int ofi_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags);
@@ -744,6 +767,10 @@ struct util_event {
 
 int ofi_eq_create(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 		 struct fid_eq **eq_fid, void *context);
+int ofi_eq_init(struct fid_fabric *fabric_fid, struct fi_eq_attr *attr,
+		struct fid_eq *eq_fid, void *context);
+int ofi_eq_control(struct fid *fid, int command, void *arg);
+int ofi_eq_cleanup(struct fid *fid);
 void ofi_eq_remove_fid_events(struct util_eq *eq, fid_t fid);
 void ofi_eq_handle_err_entry(uint32_t api_version, uint64_t flags,
 			     struct fi_eq_err_entry *err_entry,

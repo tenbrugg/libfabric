@@ -94,6 +94,7 @@ void tcpx_xfer_entry_release(struct tcpx_cq *tcpx_cq,
 
 	xfer_entry->flags = 0;
 	xfer_entry->context = 0;
+	xfer_entry->rem_len = 0;
 
 	tcpx_cq->util_cq.cq_fastlock_acquire(&tcpx_cq->util_cq.cq_lock);
 	ofi_buf_free(xfer_entry);
@@ -104,18 +105,32 @@ void tcpx_cq_report_success(struct util_cq *cq,
 			    struct tcpx_xfer_entry *xfer_entry)
 {
 	uint64_t data = 0;
+	uint64_t flags = 0;
+	void *buf = NULL;
+	size_t len = 0;
 
-	if (!(xfer_entry->flags & FI_COMPLETION))
+	flags = xfer_entry->flags;
+
+	if (!(flags & FI_MULTI_RECV) && !(flags & FI_COMPLETION))
 		return;
 
+	len = xfer_entry->hdr.base_hdr.size -
+		xfer_entry->hdr.base_hdr.payload_off;
+
 	if (xfer_entry->hdr.base_hdr.flags & OFI_REMOTE_CQ_DATA) {
-		xfer_entry->flags |= FI_REMOTE_CQ_DATA;
+		flags |= FI_REMOTE_CQ_DATA;
 		data = xfer_entry->hdr.cq_data_hdr.cq_data;
 	}
 
+	if ((flags & FI_MULTI_RECV) &&
+	    (xfer_entry->rem_len >= xfer_entry->ep->min_multi_recv_size)) {
+		buf = xfer_entry->mrecv_msg_start;
+	} else {
+		flags &= ~FI_MULTI_RECV;
+	}
+
 	ofi_cq_write(cq, xfer_entry->context,
-		     xfer_entry->flags, 0, NULL,
-		     data, 0);
+		     flags, len, buf, data, 0);
 	if (cq->wait)
 		ofi_cq_signal(&cq->cq_fid);
 }
@@ -221,6 +236,7 @@ static int tcpx_buf_pools_create(struct tcpx_buf_pool *buf_pools)
 		.alignment = 16,
 		.chunk_cnt = 1024,
 		.init_fn = tcpx_buf_pool_init,
+		.flags = OFI_BUFPOOL_HUGEPAGES,
 	};
 
 	for (i = 0; i < TCPX_OP_CODE_MAX; i++) {

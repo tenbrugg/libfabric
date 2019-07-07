@@ -1,6 +1,7 @@
 
 /*
  * Copyright (c) 2016 Intel Corporation, Inc.  All rights reserved.
+ * Copyright (c) 2019 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -63,7 +64,7 @@
 
 #define RXM_CM_DATA_VERSION	1
 #define RXM_OP_VERSION		3
-#define RXM_CTRL_VERSION	3
+#define RXM_CTRL_VERSION	4
 
 #define RXM_BUF_SIZE	16384
 extern size_t rxm_eager_limit;
@@ -74,27 +75,30 @@ extern size_t rxm_eager_limit;
 
 #define RXM_IOV_LIMIT 4
 
-#define RXM_EQ_PROGRESS_SPIN_COUNT 10000
-
 #define RXM_MR_MODES	(OFI_MR_BASIC_MAP | FI_MR_LOCAL)
+
+#define RXM_PASSTHRU_TX_OP_FLAGS (FI_TRANSMIT_COMPLETE)
+
+#define RXM_PASSTHRU_RX_OP_FLAGS 0ULL
+
+#define RXM_TX_OP_FLAGS (FI_INJECT | FI_INJECT_COMPLETE | \
+			 FI_DELIVERY_COMPLETE | FI_COMPLETION)
+#define RXM_RX_OP_FLAGS (FI_MULTI_RECV | FI_COMPLETION)
+
 #define RXM_MR_VIRT_ADDR(info) ((info->domain_attr->mr_mode == FI_MR_BASIC) ||\
 				info->domain_attr->mr_mode & FI_MR_VIRT_ADDR)
 
 #define RXM_MR_PROV_KEY(info) ((info->domain_attr->mr_mode == FI_MR_BASIC) ||\
 			       info->domain_attr->mr_mode & FI_MR_PROV_KEY)
 
-#define RXM_LOG_STATE(subsystem, pkt, prev_state, next_state) 			\
-	FI_DBG(&rxm_prov, subsystem, "[RNDV] msg_id: 0x%" PRIx64 " %s -> %s\n",	\
-	       pkt.ctrl_hdr.msg_id, rxm_proto_state_str[prev_state],		\
-	       rxm_proto_state_str[next_state])
-
-#define RXM_LOG_STATE_TX(subsystem, tx_buf, next_state)		\
-	RXM_LOG_STATE(subsystem, tx_buf->pkt, tx_buf->hdr.state,	\
-		      next_state)
-
-#define RXM_LOG_STATE_RX(subsystem, rx_buf, next_state)		\
-	RXM_LOG_STATE(subsystem, rx_buf->pkt, rx_buf->hdr.state,	\
-		      next_state)
+#define RXM_UPDATE_STATE(subsystem, buf, new_state)			\
+	do {								\
+		FI_DBG(&rxm_prov, subsystem, "[PROTO] msg_id: 0x%"	\
+		       PRIx64 " %s -> %s\n", (buf)->pkt.ctrl_hdr.msg_id,\
+		       rxm_proto_state_str[(buf)->hdr.state],		\
+		       rxm_proto_state_str[new_state]);			\
+		(buf)->hdr.state = new_state;				\
+	} while (0)
 
 #define RXM_DBG_ADDR_TAG(subsystem, log_str, addr, tag) 	\
 	FI_DBG(&rxm_prov, subsystem, log_str 			\
@@ -119,23 +123,6 @@ do {									\
 	((void *) rxm_buf_get_by_index(&(rxm_ep)->buf_pools[pool_type],		\
 				       (uint64_t) msg_id))
 
-#define RXM_Q_STRERROR(prov, log, q, q_str, entry, strerror)					\
-	FI_WARN(prov, log, "fi_" q_str "_readerr: err: %d, prov_err: %s (%d)\n",		\
-		(entry).err,strerror((q), (entry).prov_errno, (entry).err_data, NULL, 0),	\
-		(entry).prov_errno)
-
-#define RXM_CQ_READERR(prov, log, cq, ret, err_entry)			\
-	do {								\
-		(ret) = fi_cq_readerr((cq), &(err_entry), 0);		\
-		if ((ret) < 0) {					\
-			FI_WARN(prov, log,				\
-				"Unable to fi_cq_readerr: %zd\n", ret);	\
-		} else {						\
-			RXM_Q_STRERROR(prov, log, cq, "cq",		\
-				       err_entry, fi_cq_strerror);	\
-		}							\
-	} while (0)
-
 extern struct fi_provider rxm_prov;
 extern struct util_prov rxm_util_prov;
 extern struct fi_ops_rma rxm_ops_rma;
@@ -144,6 +131,7 @@ extern struct fi_ops_atomic rxm_ops_atomic;
 extern size_t rxm_msg_tx_size;
 extern size_t rxm_msg_rx_size;
 extern size_t rxm_def_univ_size;
+extern size_t rxm_cm_progress_interval;
 
 /*
  * Connection Map
@@ -152,6 +140,7 @@ extern size_t rxm_def_univ_size;
 #define RXM_CMAP_IDX_BITS OFI_IDX_INDEX_BITS
 
 enum rxm_cmap_signal {
+	RXM_CMAP_UNSPEC,
 	RXM_CMAP_FREE,
 	RXM_CMAP_EXIT,
 };
@@ -160,7 +149,6 @@ enum rxm_cmap_signal {
 	FUNC(RXM_CMAP_IDLE),		\
 	FUNC(RXM_CMAP_CONNREQ_SENT),	\
 	FUNC(RXM_CMAP_CONNREQ_RECV),	\
-	FUNC(RXM_CMAP_ACCEPT),		\
 	FUNC(RXM_CMAP_CONNECTED_NOTIFY),\
 	FUNC(RXM_CMAP_CONNECTED),	\
 	FUNC(RXM_CMAP_SHUTDOWN),	\
@@ -274,8 +262,7 @@ int rxm_cmap_connect(struct rxm_ep *rxm_ep, fi_addr_t fi_addr,
 void rxm_cmap_del_handle_ts(struct rxm_cmap_handle *handle);
 void rxm_cmap_free(struct rxm_cmap *cmap);
 int rxm_cmap_alloc(struct rxm_ep *rxm_ep, struct rxm_cmap_attr *attr);
-/* Caller must hold cmap->lock */
-int rxm_cmap_move_handle_to_peer_list(struct rxm_cmap *cmap, int index);
+int rxm_cmap_remove(struct rxm_cmap *cmap, int index);
 int rxm_msg_eq_progress(struct rxm_ep *rxm_ep);
 
 static inline struct rxm_cmap_handle *
@@ -364,6 +351,15 @@ enum rxm_proto_state {
 };
 
 extern char *rxm_proto_state_str[];
+
+enum {
+	rxm_ctrl_eager,
+	rxm_ctrl_seg,
+	rxm_ctrl_rndv,
+	rxm_ctrl_rndv_ack,
+	rxm_ctrl_atomic,
+	rxm_ctrl_atomic_resp,
+};
 
 struct rxm_pkt {
 	struct ofi_ctrl_hdr ctrl_hdr;
@@ -501,7 +497,6 @@ struct rxm_tx_rndv_buf {
 	uint64_t flags;
 	struct fid_mr *mr[RXM_IOV_LIMIT];
 	uint8_t count;
-	struct rxm_conn *conn;
 
 	/* Must stay at bottom */
 	struct rxm_pkt pkt;
@@ -514,14 +509,12 @@ struct rxm_rma_buf {
 	void *app_context;
 	uint64_t flags;
 
+	struct {
+		struct fid_mr *mr[RXM_IOV_LIMIT];
+		uint8_t count;
+	} mr;
 	/* Must stay at bottom */
- 	union {
-		struct rxm_pkt pkt;
-		struct {
-			struct fid_mr *mr[RXM_IOV_LIMIT];
-			uint8_t count;
-		} mr;
-	};
+	struct rxm_pkt pkt;
 };
 
 struct rxm_tx_atomic_buf {
@@ -600,20 +593,18 @@ struct rxm_recv_entry {
 		size_t	len;
 	} multi_recv;
 
-	union {
-		/* Used for SAR protocol */
-		struct {
-			struct dlist_entry entry;
-			size_t total_recv_len;
-			struct rxm_conn *conn;
-			uint64_t msg_id;
-		} sar;
-		/* Used for Rendezvous protocol */
-		struct {
-			/* This is used to send RNDV ACK */
-			struct rxm_tx_base_buf *tx_buf;
-		} rndv;
-	};
+	/* Used for SAR protocol */
+	struct {
+		struct dlist_entry entry;
+		size_t total_recv_len;
+		struct rxm_conn *conn;
+		uint64_t msg_id;
+	} sar;
+	/* Used for Rendezvous protocol */
+	struct {
+		/* This is used to send RNDV ACK */
+		struct rxm_tx_base_buf *tx_buf;
+	} rndv;
 };
 DECLARE_FREESTACK(struct rxm_recv_entry, rxm_recv_fs);
 
@@ -661,10 +652,8 @@ struct rxm_ep {
 	struct rxm_cmap		*cmap;
 	struct fid_pep 		*msg_pep;
 	struct fid_eq 		*msg_eq;
-	int			msg_eq_fd;
 	struct fid_cq 		*msg_cq;
-	uint32_t		msg_cq_eagain_count;
-	int			msg_cq_fd;
+	uint64_t		msg_cq_last_poll;
 	struct fid_ep 		*srx_ctx;
 	size_t 			comp_per_progress;
 	int			msg_mr_local;
@@ -706,9 +695,6 @@ struct rxm_conn {
 	/* This is saved MSG EP fid, that hasn't been closed during
 	 * handling of CONN_RECV in RXM_CMAP_CONNREQ_SENT for passive side */
 	struct fid_ep *saved_msg_ep;
-
-	/* Limit RNDV sends based on peer rx queue size to avoid increased
-	 * memory usage at peer */
 	uint32_t rndv_tx_credits;
 };
 
@@ -748,6 +734,7 @@ int rxm_msg_ep_prepost_recv(struct rxm_ep *rxm_ep, struct fid_ep *msg_ep);
 int rxm_ep_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
 			enum fi_op op, struct fi_atomic_attr *attr,
 			uint64_t flags);
+
 static inline size_t rxm_ep_max_atomic_size(struct fi_info *info)
 {
 	size_t overhead = sizeof(struct rxm_atomic_hdr) +
@@ -933,7 +920,7 @@ rxm_process_recv_entry(struct rxm_recv_queue *recv_queue,
 		dlist_remove(&rx_buf->unexp_msg.entry);
 		rx_buf->recv_entry = recv_entry;
 
-		if (rx_buf->pkt.ctrl_hdr.type != ofi_ctrl_seg_data) {
+		if (rx_buf->pkt.ctrl_hdr.type != rxm_ctrl_seg) {
 			return rxm_cq_handle_rx_buf(rx_buf);
 		} else {
 			struct dlist_entry *entry;
@@ -958,7 +945,7 @@ rxm_process_recv_entry(struct rxm_recv_queue *recv_queue,
 					continue;
 				/* Handle unordered completions from MSG provider */
 				if ((rx_buf->pkt.ctrl_hdr.msg_id != recv_entry->sar.msg_id) ||
-				    ((rx_buf->pkt.ctrl_hdr.type != ofi_ctrl_seg_data)))
+				    ((rx_buf->pkt.ctrl_hdr.type != rxm_ctrl_seg)))
 					continue;
 
 				if (!rx_buf->conn) {
@@ -1004,7 +991,7 @@ rxm_ep_prepare_tx(struct rxm_ep *rxm_ep, fi_addr_t dest_addr,
 	}
 
 	if (OFI_UNLIKELY(!dlist_empty(&(*rxm_conn)->deferred_tx_queue))) {
-		rxm_ep_progress(&rxm_ep->util_ep);
+		rxm_ep_do_progress(&rxm_ep->util_ep);
 		if (!dlist_empty(&(*rxm_conn)->deferred_tx_queue))
 			return -FI_EAGAIN;
 	}
@@ -1057,7 +1044,7 @@ rxm_rx_buf_alloc(struct rxm_ep *rxm_ep, struct fid_ep *msg_ep, uint8_t repost)
 }
 
 static inline void
-rxm_rx_buf_release(struct rxm_ep *rxm_ep, struct rxm_rx_buf *rx_buf)
+rxm_rx_buf_finish(struct rxm_rx_buf *rx_buf)
 {
 	if (rx_buf->repost) {
 		dlist_insert_tail(&rx_buf->repost_entry,

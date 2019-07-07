@@ -35,10 +35,11 @@ bin_PROGRAMS = \
 	functional/fi_multi_ep \
 	functional/fi_recv_cancel \
 	functional/fi_unexpected_msg \
+	functional/fi_unmap_mem \
 	functional/fi_inj_complete \
 	functional/fi_resmgmt_test \
 	functional/fi_rdm_atomic \
-	functional/fi_rdm_multi_recv \
+	functional/fi_multi_recv \
 	benchmarks/fi_msg_pingpong \
 	benchmarks/fi_msg_bw \
 	benchmarks/fi_rma_bw \
@@ -94,7 +95,8 @@ nobase_dist_config_DATA = \
 	test_configs/shm/all.test \
 	test_configs/shm/shm.exclude \
 	test_configs/shm/quick.test \
-	test_configs/shm/verify.test
+	test_configs/shm/verify.test \
+	test_configs/efa/efa.exclude
 
 noinst_LTLIBRARIES = libfabtests.la
 libfabtests_la_SOURCES = \
@@ -207,6 +209,10 @@ functional_fi_unexpected_msg_SOURCES = \
 	functional/unexpected_msg.c
 functional_fi_unexpected_msg_LDADD = libfabtests.la
 
+functional_fi_unmap_mem_SOURCES = \
+	functional/unmap_mem.c
+functional_fi_unmap_mem_LDADD = libfabtests.la
+
 functional_fi_rdm_multi_domain_SOURCES = \
 	functional/rdm_multi_domain.c
 functional_fi_rdm_multi_domain_LDADD = libfabtests.la
@@ -227,9 +233,9 @@ functional_fi_rdm_atomic_SOURCES = \
 	functional/rdm_atomic.c
 functional_fi_rdm_atomic_LDADD = libfabtests.la
 
-functional_fi_rdm_multi_recv_SOURCES = \
-	functional/rdm_multi_recv.c
-functional_fi_rdm_multi_recv_LDADD = libfabtests.la
+functional_fi_multi_recv_SOURCES = \
+	functional/multi_recv.c
+functional_fi_multi_recv_LDADD = libfabtests.la
 
 benchmarks_fi_msg_pingpong_SOURCES = \
 	benchmarks/msg_pingpong.c \
@@ -347,7 +353,7 @@ dummy_man_pages = \
 	man/man1/fi_rdm_atomic.1 \
 	man/man1/fi_rdm_deferred_wq.1 \
 	man/man1/fi_rdm_multi_domain.1 \
-	man/man1/fi_rdm_multi_recv.1 \
+	man/man1/fi_multi_recv.1 \
 	man/man1/fi_rdm_rma_simple.1 \
 	man/man1/fi_rdm_rma_trigger.1 \
 	man/man1/fi_rdm_shared_av.1 \
@@ -357,6 +363,7 @@ dummy_man_pages = \
 	man/man1/fi_scalable_ep.1 \
 	man/man1/fi_shared_ctx.1 \
 	man/man1/fi_unexpected_msg.1 \
+	man/man1/fi_unmap_mem.1 \
 	man/man1/fi_dgram_pingpong.1 \
 	man/man1/fi_msg_bw.1 \
 	man/man1/fi_msg_pingpong.1 \

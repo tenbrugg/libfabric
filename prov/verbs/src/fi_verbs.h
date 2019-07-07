@@ -135,18 +135,6 @@
 #define VERBS_ANY_DOMAIN "verbs_any_domain"
 #define VERBS_ANY_FABRIC "verbs_any_fabric"
 
-#define FI_IBV_MEMORY_HOOK_BEGIN(notifier)			\
-{								\
-	pthread_mutex_lock(&notifier->lock);			\
-	ofi_set_mem_free_hook(notifier->prev_free_hook);	\
-	ofi_set_mem_realloc_hook(notifier->prev_realloc_hook);	\
-
-#define FI_IBV_MEMORY_HOOK_END(notifier)				\
-	ofi_set_mem_realloc_hook(fi_ibv_mem_notifier_realloc_hook);	\
-	ofi_set_mem_free_hook(fi_ibv_mem_notifier_free_hook);		\
-	pthread_mutex_unlock(&notifier->lock);				\
-}
-
 extern struct fi_provider fi_ibv_prov;
 extern struct util_prov fi_ibv_util_prov;
 
@@ -160,10 +148,7 @@ extern struct fi_ibv_gl_data {
 	int	use_odp;
 	int	cqread_bunch_size;
 	char	*iface;
-	int	mr_cache_enable;
-	int	mr_max_cached_cnt;
-	size_t	mr_max_cached_size;
-	int	mr_cache_merge_regions;
+	int	gid_idx;
 
 	struct {
 		int	buffer_num;
@@ -263,10 +248,18 @@ struct fi_ibv_eq_entry {
 
 typedef int (*fi_ibv_trywait_func)(struct fid *fid);
 
-/* The number of valid OFI indexer bits in the connection key used during
- * XRC connection establishment. Note that only the lower 32-bits of the
- * key are exchanged, so this value must be kept below 32-bits. */
-#define VERBS_TAG_INDEX_BITS	18
+/* An OFI indexer is used to maintain a unique connection request to
+ * endpoint mapping. The key is a 32-bit value (referred to as a
+ * connection tag) and is passed to the remote peer by the active side
+ * of a connection request. When the reciprocal XRC connection in the
+ * reverse direction is made, the key is passed back and used to map
+ * back to the original endpoint. A key is defined as a 32-bit value:
+ *
+ *     SSSSSSSS:SSSSSSII:IIIIIIII:IIIIIIII
+ *     |-- sequence -||--- unique key ---|
+ */
+#define VERBS_CONN_TAG_INDEX_BITS	18
+#define VERBS_CONN_TAG_INVALID		0xFFFFFFFF	/* Key is not valid */
 
 struct fi_ibv_eq {
 	struct fid_eq		eq_fid;
@@ -296,6 +289,7 @@ struct fi_ibv_eq {
 
 int fi_ibv_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 		   struct fid_eq **eq, void *context);
+int fi_ibv_eq_trywait(struct fi_ibv_eq *eq);
 
 int fi_ibv_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		   struct fid_av **av, void *context);
@@ -318,8 +312,6 @@ typedef int(*fi_ibv_mr_reg_cb)(struct fi_ibv_domain *domain, void *buf,
 			       size_t len, uint64_t access,
 			       struct fi_ibv_mem_desc *md);
 typedef int(*fi_ibv_mr_dereg_cb)(struct fi_ibv_mem_desc *md);
-
-struct fi_ibv_mem_notifier;
 
 struct fi_ibv_domain {
 	struct util_domain		util_domain;
@@ -349,10 +341,8 @@ struct fi_ibv_domain {
 	/* MR stuff */
 	int				use_odp;
 	struct ofi_mr_cache		cache;
-	struct ofi_mem_monitor		monitor;
 	fi_ibv_mr_reg_cb		internal_mr_reg;
 	fi_ibv_mr_dereg_cb		internal_mr_dereg;
-	struct fi_ibv_mem_notifier	*notifier;
 	int 				(*post_send)(struct ibv_qp *qp,
 						     struct ibv_send_wr *wr,
 						     struct ibv_send_wr **bad_wr);
@@ -381,7 +371,6 @@ struct fi_ibv_cq {
 	int			signal_fd[2];
 	fi_ibv_cq_read_entry	read_entry;
 	struct slist		wcq;
-	fi_ibv_trywait_func	trywait;
 	ofi_atomic32_t		nevents;
 	struct ofi_bufpool	*wce_pool;
 
@@ -398,6 +387,7 @@ struct fi_ibv_cq {
 
 int fi_ibv_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 		   struct fid_cq **cq, void *context);
+int fi_ibv_cq_trywait(struct fi_ibv_cq *cq);
 
 struct fi_ibv_mem_desc {
 	struct fid_mr		mr_fid;
@@ -426,29 +416,6 @@ struct fi_ibv_mr_internal_ops {
 	fi_ibv_mr_dereg_cb	internal_mr_dereg;
 };
 
-struct fi_ibv_mem_notifier {
-	RbtHandle			subscr_storage;
-	ofi_mem_free_hook		prev_free_hook;
-	ofi_mem_realloc_hook		prev_realloc_hook;
-	int				ref_cnt;
-	pthread_mutex_t			lock;
-};
-
-struct fi_ibv_subscr_entry {
-	struct dlist_entry	entry;
-	struct ofi_subscription	*subscription;
-};
-
-struct fi_ibv_monitor_entry {
-	struct dlist_entry	subscription_list;
-	struct iovec		iov;
-};
-
-extern struct fi_ibv_mem_notifier *fi_ibv_mem_notifier;
-
-void fi_ibv_mem_notifier_free_hook(void *ptr, const void *caller);
-void *fi_ibv_mem_notifier_realloc_hook(void *ptr, size_t size, const void *caller);
-void fi_ibv_mem_notifier_free(void);
 
 extern struct fi_ibv_mr_internal_ops fi_ibv_mr_internal_ops;
 extern struct fi_ibv_mr_internal_ops fi_ibv_mr_internal_cache_ops;
@@ -458,11 +425,6 @@ int fi_ibv_mr_cache_entry_reg(struct ofi_mr_cache *cache,
 			      struct ofi_mr_entry *entry);
 void fi_ibv_mr_cache_entry_dereg(struct ofi_mr_cache *cache,
 				 struct ofi_mr_entry *entry);
-int fi_ibv_monitor_subscribe(struct ofi_mem_monitor *notifier,
-			     struct ofi_subscription *subscription);
-void fi_ibv_monitor_unsubscribe(struct ofi_mem_monitor *notifier,
-				struct ofi_subscription *subscription);
-struct ofi_subscription *fi_ibv_monitor_get_event(struct ofi_mem_monitor *notifier);
 
 /*
  * An XRC SRQ cannot be created until the associated RX CQ is known,
@@ -567,7 +529,12 @@ enum fi_ibv_xrc_ep_conn_state {
  * is established.
  */
 struct fi_ibv_xrc_ep_conn_setup {
+	/* The connection tag is used to associate the reciprocal
+	 * XRC INI/TGT QP connection request in the reverse direction
+	 * with the original request. The tag is created by the
+	 * original active side. */
 	uint32_t			conn_tag;
+	bool				created_conn_tag;
 
 	/* IB CM message stale/duplicate detection processing requires
 	 * that shared INI/TGT connections use unique QP numbers during
@@ -577,6 +544,10 @@ struct fi_ibv_xrc_ep_conn_setup {
 	struct ibv_qp			*rsvd_ini_qpn;
 	struct ibv_qp			*rsvd_tgt_qpn;
 
+	/* Temporary flags to indicate if the INI QP setup and the
+	 * TGT QP setup have completed. */
+	bool				ini_connected;
+	bool				tgt_connected;
 
 	/* Delivery of the FI_CONNECTED event is delayed until
 	 * bidirectional connectivity is established. */
@@ -615,6 +586,7 @@ struct fi_ibv_ep {
 	size_t				rx_size;
 };
 
+#define VERBS_XRC_EP_MAGIC		0x1F3D5B79
 struct fi_ibv_xrc_ep {
 	/* Must be first */
 	struct fi_ibv_ep		base_ep;
@@ -623,6 +595,7 @@ struct fi_ibv_xrc_ep {
 	struct rdma_cm_id		*tgt_id;
 	struct ibv_qp			*tgt_ibv_qp;
 	enum fi_ibv_xrc_ep_conn_state	conn_state;
+	uint32_t			magic;
 	uint32_t			srqn;
 	uint32_t			peer_srqn;
 
@@ -722,7 +695,7 @@ int fi_ibv_connect_xrc(struct fi_ibv_xrc_ep *ep, struct sockaddr *addr,
 		       int reciprocal, void *param, size_t paramlen);
 int fi_ibv_accept_xrc(struct fi_ibv_xrc_ep *ep, int reciprocal,
 		      void *param, size_t paramlen);
-void fi_ibv_free_xrc_conn_setup(struct fi_ibv_xrc_ep *ep);
+void fi_ibv_free_xrc_conn_setup(struct fi_ibv_xrc_ep *ep, int disconnect);
 void fi_ibv_add_pending_ini_conn(struct fi_ibv_xrc_ep *ep, int reciprocal,
 				 void *conn_param, size_t conn_paramlen);
 void fi_ibv_sched_ini_conn(struct fi_ibv_ini_shared_conn *ini_conn);
@@ -809,7 +782,7 @@ struct fi_ibv_dgram_av_entry {
 static inline struct fi_ibv_dgram_av_entry*
 fi_ibv_dgram_av_lookup_av_entry(fi_addr_t fi_addr)
 {
-	return (struct fi_ibv_dgram_av_entry *)fi_addr;
+	return (struct fi_ibv_dgram_av_entry *) (uintptr_t) fi_addr;
 }
 
 /* NOTE:

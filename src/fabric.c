@@ -323,15 +323,15 @@ static struct ofi_prov *ofi_create_prov_entry(const char *prov_name)
 static void ofi_ordered_provs_init(void)
 {
 	char *ordered_prov_names[] = {
-		"psm2", "psm", "usnic", "mlx", "gni",
-		"bgq", "netdir", "ofi_rxm", "ofi_rxd", "verbs",
+		"psm2", "psm", "efa", "usnic", "gni", "bgq", "verbs",
+		"netdir", "ofi_rxm", "ofi_rxd", "shm", "mlx",
 		/* Initialize the socket based providers last of the
 		 * standard providers.  This will result in them being
 		 * the least preferred providers.
 		 */
 
 		/* Before you add ANYTHING here, read the comment above!!! */
-		"UDP", "sockets", "tcp", /* NOTHING GOES HERE! */
+		"UDP", "tcp", "sockets", /* NOTHING GOES HERE! */
 		/* Seriously, read it! */
 
 		/* These are hooking providers only.  Their order
@@ -551,9 +551,11 @@ void fi_ini(void)
 	fi_param_init();
 	fi_log_init();
 	ofi_osd_init();
+	ofi_mem_init();
 	ofi_pmem_init();
 	ofi_perf_init();
 	ofi_hook_init();
+	ofi_monitor_init();
 
 	fi_param_define(NULL, "provider", FI_PARAM_STRING,
 			"Only use specified provider (default: all available)");
@@ -614,7 +616,7 @@ libdl_done:
 	/* ofi_register_provider(RSTREAM_INIT, NULL); - no support */
 	ofi_register_provider(MRAIL_INIT, NULL);
 	ofi_register_provider(RXD_INIT, NULL);
-
+	ofi_register_provider(EFA_INIT, NULL);
 	ofi_register_provider(UDP_INIT, NULL);
 	ofi_register_provider(SOCKETS_INIT, NULL);
 	ofi_register_provider(TCP_INIT, NULL);
@@ -644,6 +646,8 @@ FI_DESTRUCTOR(fi_fini(void))
 	}
 
 	ofi_free_filter(&prov_filter);
+	ofi_monitor_cleanup();
+	ofi_mem_fini();
 	fi_log_fini();
 	fi_param_fini();
 	ofi_osd_fini();

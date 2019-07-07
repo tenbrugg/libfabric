@@ -55,10 +55,7 @@ struct fi_ibv_gl_data fi_ibv_gl_data = {
 	.use_odp		= 0,
 	.cqread_bunch_size	= 8,
 	.iface			= NULL,
-	.mr_cache_enable	= 0,
-	.mr_max_cached_cnt	= 4096,
-	.mr_max_cached_size	= ULONG_MAX,
-	.mr_cache_merge_regions	= 0,
+	.gid_idx		= 0,
 	.dgram			= {
 		.use_name_server	= 1,
 		.name_server_port	= 5678,
@@ -85,7 +82,7 @@ struct fi_ibv_dev_preset {
 struct fi_provider fi_ibv_prov = {
 	.name = VERBS_PROV_NAME,
 	.version = VERBS_PROV_VERS,
-	.fi_version = FI_VERSION(1, 7),
+	.fi_version = FI_VERSION(1, 8),
 	.getinfo = fi_ibv_getinfo,
 	.fabric = fi_ibv_fabric,
 	.cleanup = fi_ibv_fini
@@ -292,10 +289,10 @@ static int fi_ibv_param_define(const char *param_name, const char *param_str,
 		goto fn;
 	}
 
-	strncat(param_help, param_str, param_str_sz);
-	strncat(param_help, begin_def_section, begin_def_section_sz);
-	strncat(param_help, param_default_str, param_default_sz);
-	strncat(param_help, end_def_section, end_def_section_sz);
+	strncat(param_help, param_str, param_str_sz + 1);
+	strncat(param_help, begin_def_section, begin_def_section_sz + 1);
+	strncat(param_help, param_default_str, param_default_sz + 1);
+	strncat(param_help, end_def_section, end_def_section_sz + 1);
 
 	param_help[len - 1] = '\0';
 
@@ -489,25 +486,6 @@ static int fi_ibv_get_param_bool(const char *param_name,
 	return 0;
 }
 
-static int fi_ibv_get_param_size_t(const char *param_name,
-				   const char *param_str,
-				   size_t *param_default)
-{
-	int ret;
-	size_t param;
-
-	ret = fi_ibv_param_define(param_name, param_str,
-				  FI_PARAM_SIZE_T,
-				  param_default);
-	if (ret)
-		return ret;
-
-	if (!fi_param_get_size_t(&fi_ibv_prov, param_name, &param))
-		*param_default = param;
-
-	return 0;
-}
-
 static int fi_ibv_get_param_str(const char *param_name,
 				const char *param_str,
 				char **param_default)
@@ -615,36 +593,6 @@ static int fi_ibv_read_params(void)
 			   "Invalid value of iface\n");
 		return -FI_EINVAL;
 	}
-	if (fi_ibv_get_param_bool("mr_cache_enable",
-				  "Enable Memory Region caching",
-				  &fi_ibv_gl_data.mr_cache_enable)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of mr_cache_enable\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_int("mr_max_cached_cnt",
-				 "Maximum number of cache entries",
-				 &fi_ibv_gl_data.mr_max_cached_cnt) ||
-	    (fi_ibv_gl_data.mr_max_cached_cnt < 0)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of mr_max_cached_cnt\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_size_t("mr_max_cached_size",
-				    "Maximum total size of cache entries",
-				    &fi_ibv_gl_data.mr_max_cached_size)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of mr_max_cached_size\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_bool("mr_cache_merge_regions",
-				  "Enable the merging of MR regions for MR "
-				  "caching functionality",
-				  &fi_ibv_gl_data.mr_cache_merge_regions)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of mr_cache_merge_regions\n");
-		return -FI_EINVAL;
-	}
 
 	/* DGRAM-specific parameters */
 	if (getenv("OMPI_COMM_WORLD_RANK") || getenv("PMI_RANK"))
@@ -667,20 +615,35 @@ static int fi_ibv_read_params(void)
 			   "Invalid value of dgram_name_server_port\n");
 		return -FI_EINVAL;
 	}
+	if (fi_ibv_get_param_int("gid_idx", "Set which gid index to use "
+				 "attribute (0 - 255)",
+				 &fi_ibv_gl_data.gid_idx) ||
+	    (fi_ibv_gl_data.gid_idx < 0 ||
+	     fi_ibv_gl_data.gid_idx > 255)) {
+		VERBS_WARN(FI_LOG_CORE,
+			   "Invalid value of gid index\n");
+		return -FI_EINVAL;
+	}
 
 	return FI_SUCCESS;
 }
 
 static void fi_ibv_fini(void)
 {
-	if (fi_ibv_mem_notifier)
-		fi_ibv_mem_notifier_free();
+#if HAVE_VERBS_DL
+	ofi_monitor_cleanup();
+	ofi_mem_fini();
+#endif
 	fi_freeinfo((void *)fi_ibv_util_prov.info);
 	fi_ibv_util_prov.info = NULL;
 }
 
 VERBS_INI
 {
+#if HAVE_VERBS_DL
+	ofi_mem_init();
+	ofi_monitor_init();
+#endif
 	if (fi_ibv_read_params()|| fi_ibv_init_info(&fi_ibv_util_prov.info))
 		return NULL;
 	return &fi_ibv_prov;

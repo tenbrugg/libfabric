@@ -807,7 +807,8 @@ int ft_server_connect(void)
 	return 0;
 
 err:
-	fi_reject(pep, fi->handle, NULL, 0);
+	if (fi)
+		fi_reject(pep, fi->handle, NULL, 0);
 	return ret;
 }
 
@@ -1084,7 +1085,7 @@ int ft_init_av_dst_addr(struct fid_av *av_ptr, struct fid_ep *ep_ptr,
 	size_t addrlen;
 	int ret;
 
-	if (opts.oob_port) {
+	if (opts.options & FT_OPT_OOB_ADDR_EXCH) {
 		ret = ft_exchange_addresses_oob(av_ptr, ep_ptr, remote_addr);
 		if (ret)
 			return ret;
@@ -1154,7 +1155,7 @@ int ft_init_av_addr(struct fid_av *av_ptr, struct fid_ep *ep_ptr,
 	size_t addrlen;
 	int ret;
 
-	if (opts.oob_port)
+	if (opts.options & FT_OPT_OOB_ADDR_EXCH)
 		return ft_exchange_addresses_oob(av_ptr, ep_ptr, remote_addr);
 
 	if (opts.dst_addr) {
@@ -2617,6 +2618,8 @@ void ft_usage(char *name, char *desc)
 	FT_PRINT_OPTS_USAGE("", "fi_unexpected_msg");
 	FT_PRINT_OPTS_USAGE("", "fi_resmgmt_test");
 	FT_PRINT_OPTS_USAGE("", "fi_inj_complete");
+	FT_PRINT_OPTS_USAGE("-M <mode>", "Disable mode bit from test");
+	FT_PRINT_OPTS_USAGE("", "mr_local");
 	FT_PRINT_OPTS_USAGE("-a <address vector name>", "name of address vector");
 	FT_PRINT_OPTS_USAGE("-h", "display this help output");
 
@@ -2659,7 +2662,8 @@ void ft_csusage(char *name, char *desc)
 	return;
 }
 
-void ft_parseinfo(int op, char *optarg, struct fi_info *hints)
+void ft_parseinfo(int op, char *optarg, struct fi_info *hints,
+		  struct ft_opts *opts)
 {
 	switch (op) {
 	case 'f':
@@ -2699,6 +2703,10 @@ void ft_parseinfo(int op, char *optarg, struct fi_info *hints)
 			hints->ep_attr->type = FI_EP_RDM;
 		if (!strncasecmp("dgram", optarg, 5))
 			hints->ep_attr->type = FI_EP_DGRAM;
+		break;
+	case 'M':
+		if (!strncasecmp("mr_local", optarg, 8))
+			opts->mr_mode &= ~FI_MR_LOCAL;
 		break;
 	default:
 		/* let getopt handle unknown opts*/

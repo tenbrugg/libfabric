@@ -54,6 +54,25 @@
 #   define VALGRIND_MAKE_MEM_DEFINED(addr, len)
 #endif
 
+
+void ofi_mem_init(void);
+void ofi_mem_fini(void);
+
+enum {
+	OFI_PAGE_SIZE,
+	OFI_DEF_HUGEPAGE_SIZE,
+};
+
+extern size_t *page_sizes;
+extern size_t num_page_sizes;
+
+static inline long ofi_get_page_size()
+{
+	return ofi_sysconf(_SC_PAGESIZE);
+}
+ssize_t ofi_get_hugepage_size(void);
+
+
 /* We implement memdup to avoid external library dependency */
 static inline void *mem_dup(const void *src, size_t size)
 {
@@ -204,7 +223,10 @@ static inline void* smr_freestack_pop_impl(void *fs, void *next)
 
 	local = (char **) fs + ((char **) next -
 		(char **) freestack->base_addr);
-	next = *((void **) local);
+
+	freestack->next = *((void **)local);
+	freestack_init_next(local);
+
 	return freestack_get_user_buf(local);
 }
 
@@ -261,25 +283,21 @@ static inline void name ## _free(struct name *fs)		\
 enum {
 	OFI_BUFPOOL_INDEXED		= 1 << 1,
 	OFI_BUFPOOL_NO_TRACK		= 1 << 2,
-	OFI_BUFPOOL_MMAPPED		= 1 << 3,
+	OFI_BUFPOOL_HUGEPAGES		= 1 << 3,
 };
 
 struct ofi_bufpool_region;
 
-typedef int (*ofi_bufpool_alloc_fn)(struct ofi_bufpool_region *region);
-typedef void (*ofi_bufpool_free_fn)(struct ofi_bufpool_region *region);
-typedef void (*ofi_bufpool_init_fn)(struct ofi_bufpool_region *region, void *buf);
-
 struct ofi_bufpool_attr {
-	size_t 				size;
-	size_t 				alignment;
-	size_t	 			max_cnt;
-	size_t 				chunk_cnt;
-	ofi_bufpool_alloc_fn 		alloc_fn;
-	ofi_bufpool_free_fn 		free_fn;
-	ofi_bufpool_init_fn 		init_fn;
-	void 				*context;
-	int				flags;
+	size_t 		size;
+	size_t 		alignment;
+	size_t	 	max_cnt;
+	size_t 		chunk_cnt;
+	int		(*alloc_fn)(struct ofi_bufpool_region *region);
+	void		(*free_fn)(struct ofi_bufpool_region *region);
+	void		(*init_fn)(struct ofi_bufpool_region *region, void *buf);
+	void 		*context;
+	int		flags;
 };
 
 struct ofi_bufpool {
@@ -323,20 +341,19 @@ struct ofi_bufpool_hdr {
 int ofi_bufpool_create_attr(struct ofi_bufpool_attr *attr,
 			    struct ofi_bufpool **buf_pool);
 
-int ofi_bufpool_create_ex(struct ofi_bufpool **buf_pool,
-			  size_t size, size_t alignment,
-			  size_t max_cnt, size_t chunk_cnt,
-			  ofi_bufpool_alloc_fn alloc_fn,
-			  ofi_bufpool_free_fn free_fn,
-			  void *pool_ctx);
-
-static inline int ofi_bufpool_create(struct ofi_bufpool **pool,
-				     size_t size, size_t alignment,
-				     size_t max_cnt, size_t chunk_cnt)
+static inline int
+ofi_bufpool_create(struct ofi_bufpool **buf_pool,
+		   size_t size, size_t alignment,
+		   size_t max_cnt, size_t chunk_cnt, int flags)
 {
-	return ofi_bufpool_create_ex(pool, size, alignment,
-				     max_cnt, chunk_cnt,
-				     NULL, NULL, NULL);
+	struct ofi_bufpool_attr attr = {
+		.size		= size,
+		.alignment 	= alignment,
+		.max_cnt	= max_cnt,
+		.chunk_cnt	= chunk_cnt,
+		.flags		= flags,
+	};
+	return ofi_bufpool_create_attr(&attr, buf_pool);
 }
 
 void ofi_bufpool_destroy(struct ofi_bufpool *pool);

@@ -62,8 +62,8 @@
 #ifndef _TCP_H_
 #define _TCP_H_
 
-#define TCPX_MAJOR_VERSION 	0
-#define TCPX_MINOR_VERSION 	1
+#define TCPX_MAJOR_VERSION 	1
+#define TCPX_MINOR_VERSION 	0
 
 #define TCPX_HDR_VERSION	3
 #define TCPX_CTRL_HDR_VERSION	3
@@ -74,6 +74,8 @@
 
 #define MAX_EPOLL_EVENTS	100
 #define STAGE_BUF_SIZE		512
+
+#define TCPX_MIN_MULTI_RECV	16384
 
 #define TCPX_PORT_MAX_RANGE	(USHRT_MAX)
 
@@ -172,6 +174,7 @@ struct tcpx_rx_ctx {
 	struct fid_ep		rx_fid;
 	struct slist		rx_queue;
 	struct ofi_bufpool	*buf_pool;
+	uint64_t		op_flags;
 	fastlock_t		lock;
 };
 
@@ -205,12 +208,15 @@ struct tcpx_ep {
 	tcpx_get_rx_func_t	get_rx_entry[ofi_op_write + 1];
 	void (*hdr_bswap)(struct tcpx_base_hdr *hdr);
 	struct stage_buf	stage_buf;
+	size_t			min_multi_recv_size;
 	bool			send_ready_monitor;
 };
 
 struct tcpx_fabric {
 	struct util_fabric	util_fabric;
 };
+
+typedef void (*release_func_t)(struct tcpx_xfer_entry *xfer_entry);
 
 struct tcpx_xfer_entry {
 	struct slist_entry	entry;
@@ -225,6 +231,8 @@ struct tcpx_xfer_entry {
 	uint64_t		flags;
 	void			*context;
 	uint64_t		rem_len;
+	void			*mrecv_msg_start;
+	release_func_t		rx_msg_release_fn;
 };
 
 struct tcpx_domain {
@@ -240,6 +248,15 @@ struct tcpx_cq {
 	struct util_cq		util_cq;
 	/* buf_pools protected by util.cq_lock */
 	struct tcpx_buf_pool	buf_pools[TCPX_OP_CODE_MAX];
+};
+
+struct tcpx_eq {
+	struct util_eq		util_eq;
+	/*
+	  The following lock avoids race between ep close
+	  and connection management code.
+	 */
+	fastlock_t		close_lock;
 };
 
 int tcpx_create_fabric(struct fi_fabric_attr *attr,
@@ -280,10 +297,12 @@ void tcpx_xfer_entry_release(struct tcpx_cq *tcpx_cq,
 			     struct tcpx_xfer_entry *xfer_entry);
 void tcpx_srx_xfer_release(struct tcpx_rx_ctx *srx_ctx,
 			   struct tcpx_xfer_entry *xfer_entry);
-void tcpx_rx_msg_release(struct tcpx_xfer_entry *rx_entry);
-struct tcpx_xfer_entry *
-tcpx_srx_dequeue(struct tcpx_rx_ctx *srx_ctx);
 
+void tcpx_rx_msg_release(struct tcpx_xfer_entry *rx_entry);
+void tcpx_rx_multi_recv_release(struct tcpx_xfer_entry *rx_entry);
+struct tcpx_xfer_entry *
+tcpx_srx_next_xfer_entry(struct tcpx_rx_ctx *srx_ctx,
+			struct tcpx_ep *ep, size_t entry_size);
 
 void tcpx_progress(struct util_ep *util_ep);
 void tcpx_ep_progress(struct tcpx_ep *ep);
@@ -293,7 +312,6 @@ void tcpx_hdr_bswap(struct tcpx_base_hdr *hdr);
 
 int tcpx_ep_shutdown_report(struct tcpx_ep *ep, fid_t fid);
 int tcpx_cq_wait_ep_add(struct tcpx_ep *ep);
-void tcpx_cq_wait_ep_del(struct tcpx_ep *ep);
 void tcpx_tx_queue_insert(struct tcpx_ep *tcpx_ep,
 			  struct tcpx_xfer_entry *tx_entry);
 

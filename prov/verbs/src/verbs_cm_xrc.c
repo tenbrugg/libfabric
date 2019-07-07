@@ -52,7 +52,7 @@ void fi_ibv_next_xrc_conn_state(struct fi_ibv_xrc_ep *ep)
 		break;
 	default:
 		assert(0);
-		VERBS_WARN(FI_LOG_FABRIC, "Unkown XRC connection state %d\n",
+		VERBS_WARN(FI_LOG_EP_CTRL, "Unkown XRC connection state %d\n",
 			   ep->conn_state);
 	}
 }
@@ -76,7 +76,7 @@ void fi_ibv_prev_xrc_conn_state(struct fi_ibv_xrc_ep *ep)
 		break;
 	default:
 		assert(0);
-		VERBS_WARN(FI_LOG_FABRIC, "Unkown XRC connection state %d\n",
+		VERBS_WARN(FI_LOG_EP_CTRL, "Unkown XRC connection state %d\n",
 			   ep->conn_state);
 	}
 }
@@ -163,28 +163,45 @@ void fi_ibv_log_ep_conn(struct fi_ibv_xrc_ep *ep, char *desc)
 			  ep, ep->conn_setup->rsvd_tgt_qpn->qp_num);
 }
 
-void fi_ibv_free_xrc_conn_setup(struct fi_ibv_xrc_ep *ep)
+/* Caller must hold eq:lock */
+void fi_ibv_free_xrc_conn_setup(struct fi_ibv_xrc_ep *ep, int disconnect)
 {
 	assert(ep->conn_setup);
 
-	/* Disconnect RDMA CM IDs used for the shared XRC connections,
-	 * releasing the QP used to reserve a QP number during shared
-	 * connection setup. */
-	if (ep->conn_setup->rsvd_ini_qpn) {
+	/* Free shared connection reserved QP number resources. If
+	 * a disconnect is requested and required then initiate a
+	 * disconnect sequence (the XRC INI QP side disconnect is
+	 * initiated when the remote target disconnect is received).
+	 * If disconnecting, the QP resources will be destroyed when
+	 * the timewait state has been exited or the EP is closed. */
+	if (ep->conn_setup->rsvd_ini_qpn && !disconnect) {
 		assert(ep->base_ep.id);
-		ep->base_ep.id->qp = ep->conn_setup->rsvd_ini_qpn;
-		rdma_disconnect(ep->base_ep.id);
+		assert(!ep->base_ep.id->qp);
+
 		ibv_destroy_qp(ep->conn_setup->rsvd_ini_qpn);
-	}
-	if (ep->conn_setup->rsvd_tgt_qpn) {
-		assert(ep->tgt_id);
-		ep->tgt_id->qp = ep->conn_setup->rsvd_tgt_qpn;
-		rdma_disconnect(ep->tgt_id);
-		ibv_destroy_qp(ep->conn_setup->rsvd_tgt_qpn);
+		ep->conn_setup->rsvd_ini_qpn = NULL;
 	}
 
-	free(ep->conn_setup);
-	ep->conn_setup = NULL;
+	if (ep->conn_setup->rsvd_tgt_qpn) {
+		assert(ep->tgt_id);
+		assert(!ep->tgt_id->qp);
+
+		if (disconnect && ep->conn_setup->tgt_connected) {
+			rdma_disconnect(ep->tgt_id);
+			ep->conn_setup->tgt_connected = 0;
+		} else {
+			ibv_destroy_qp(ep->conn_setup->rsvd_tgt_qpn);
+			ep->conn_setup->rsvd_tgt_qpn = NULL;
+		}
+	}
+
+	if (ep->conn_setup->conn_tag != VERBS_CONN_TAG_INVALID)
+		fi_ibv_eq_clear_xrc_conn_tag(ep);
+
+	if (!disconnect) {
+		free(ep->conn_setup);
+		ep->conn_setup = NULL;
+	}
 }
 
 int fi_ibv_connect_xrc(struct fi_ibv_xrc_ep *ep, struct sockaddr *addr,
@@ -206,16 +223,10 @@ int fi_ibv_connect_xrc(struct fi_ibv_xrc_ep *ep, struct sockaddr *addr,
 		ofi_straddr_dbg(&fi_ibv_prov, FI_LOG_FABRIC,
 				"XRC connect dest_addr", peer_addr);
 
-	if (!reciprocal) {
-		ep->conn_setup = calloc(1, sizeof(*ep->conn_setup));
-		if (!ep->conn_setup)
-			return -FI_ENOMEM;
-	}
-
 	fastlock_acquire(&domain->xrc.ini_mgmt_lock);
 	ret = fi_ibv_get_shared_ini_conn(ep, &ep->ini_conn);
 	if (ret) {
-		VERBS_WARN(FI_LOG_FABRIC,
+		VERBS_WARN(FI_LOG_EP_CTRL,
 			   "Get of shared XRC INI connection failed %d\n", ret);
 		fastlock_release(&domain->xrc.ini_mgmt_lock);
 		if (!reciprocal) {
@@ -256,6 +267,7 @@ void fi_ibv_ep_ini_conn_done(struct fi_ibv_xrc_ep *ep, uint32_t peer_srqn,
 			  ep->ini_conn->tgt_qpn);
 	}
 
+	ep->conn_setup->ini_connected = 1;
 	fi_ibv_log_ep_conn(ep, "INI Connection Done");
 	fi_ibv_sched_ini_conn(ep->ini_conn);
 	fastlock_release(&domain->xrc.ini_mgmt_lock);
@@ -284,6 +296,7 @@ void fi_ibv_ep_tgt_conn_done(struct fi_ibv_xrc_ep *ep)
 		assert(ep->tgt_ibv_qp == ep->tgt_id->qp);
 		ep->tgt_id->qp = NULL;
 	}
+	ep->conn_setup->tgt_connected = 1;
 }
 
 int fi_ibv_accept_xrc(struct fi_ibv_xrc_ep *ep, int reciprocal,
@@ -326,9 +339,7 @@ int fi_ibv_accept_xrc(struct fi_ibv_xrc_ep *ep, int reciprocal,
 	if (!ep->tgt_id->qp)
 		conn_param.qp_num = ep->conn_setup->rsvd_tgt_qpn->qp_num;
 
-	if (connreq->xrc.is_reciprocal)
-		fi_ibv_eq_clear_xrc_conn_tag(ep);
-	else
+	if (!connreq->xrc.is_reciprocal)
 		ep->conn_setup->conn_tag = connreq->xrc.conn_tag;
 
 	assert(ep->conn_state == FI_IBV_XRC_UNCONNECTED ||
@@ -338,8 +349,8 @@ int fi_ibv_accept_xrc(struct fi_ibv_xrc_ep *ep, int reciprocal,
 	ret = rdma_accept(ep->tgt_id, &conn_param);
 	if (OFI_UNLIKELY(ret)) {
 		ret = -errno;
-		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL,
-				 "XRC TGT, rdma_accept", errno);
+		VERBS_WARN(FI_LOG_EP_CTRL,
+			   "XRC TGT, rdma_accept error %d\n", ret);
 		fi_ibv_prev_xrc_conn_state(ep);
 	} else
 		free(connreq);

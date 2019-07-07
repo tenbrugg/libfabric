@@ -38,8 +38,8 @@
 #include <ofi_prov.h>
 #include "rxm.h"
 
-#define RXM_ATOMIC_UNSUPPORTED_MSG_ORDER (FI_ORDER_RAR | FI_ORDER_RAW |	\
-					  FI_ORDER_WAR | FI_ORDER_WAW |	\
+#define RXM_ATOMIC_UNSUPPORTED_MSG_ORDER (OFI_ORDER_RAR_SET | OFI_ORDER_RAW_SET | \
+					  OFI_ORDER_WAR_SET | OFI_ORDER_WAW_SET | \
 					  FI_ORDER_SAR | FI_ORDER_SAW)
 
 #define RXM_PASSTHRU_CAPS (FI_MSG | FI_RMA | FI_SEND | FI_RECV |	\
@@ -106,16 +106,17 @@ int rxm_info_to_core(uint32_t version, const struct fi_info *hints,
 
 		if (hints->domain_attr) {
 			core_info->domain_attr->caps |= hints->domain_attr->caps;
-			if (rxm_needs_atomic_progress(hints))
-				core_info->domain_attr->threading = FI_THREAD_SAFE;
-			else
-				core_info->domain_attr->threading = hints->domain_attr->threading;
+			core_info->domain_attr->threading = hints->domain_attr->threading;
 		}
 		if (hints->tx_attr) {
+			core_info->tx_attr->op_flags =
+				hints->tx_attr->op_flags & RXM_PASSTHRU_TX_OP_FLAGS;
 			core_info->tx_attr->msg_order = hints->tx_attr->msg_order;
 			core_info->tx_attr->comp_order = hints->tx_attr->comp_order;
 		}
 		if (hints->rx_attr) {
+			core_info->rx_attr->op_flags =
+				hints->rx_attr->op_flags & RXM_PASSTHRU_RX_OP_FLAGS;
 			core_info->rx_attr->msg_order = hints->rx_attr->msg_order;
 			core_info->rx_attr->comp_order = hints->rx_attr->comp_order;
 		}
@@ -127,7 +128,10 @@ int rxm_info_to_core(uint32_t version, const struct fi_info *hints,
 		core_info->ep_attr->rx_ctx_cnt = FI_SHARED_CONTEXT;
 	}
 
+	core_info->tx_attr->op_flags &= ~RXM_TX_OP_FLAGS;
 	core_info->tx_attr->size = rxm_msg_tx_size;
+
+	core_info->rx_attr->op_flags &= ~FI_MULTI_RECV;
 	core_info->rx_attr->size = rxm_msg_rx_size;
 
 	return 0;
@@ -262,6 +266,8 @@ static void rxm_alter_info(const struct fi_info *hints, struct fi_info *info)
 					hints->ep_attr->mem_tag_format;
 			}
 		}
+		if (cur->domain_attr->data_progress == FI_PROGRESS_AUTO)
+			cur->domain_attr->threading = FI_THREAD_SAFE;
 	}
 }
 
@@ -340,7 +346,7 @@ static void rxm_fini(void)
 struct fi_provider rxm_prov = {
 	.name = OFI_UTIL_PREFIX "rxm",
 	.version = FI_VERSION(RXM_MAJOR_VERSION, RXM_MINOR_VERSION),
-	.fi_version = FI_VERSION(1, 7),
+	.fi_version = FI_VERSION(1, 8),
 	.getinfo = rxm_getinfo,
 	.fabric = rxm_fabric,
 	.cleanup = rxm_fini
@@ -375,7 +381,7 @@ RXM_INI
 			"rendezvous protocol.", sizeof(struct rxm_pkt));
 
 	fi_param_define(&rxm_prov, "use_srx", FI_PARAM_BOOL,
-			"Set this enivronment variable to control the RxM "
+			"Set this environment variable to control the RxM "
 			"receive path. If this variable set to 1 (default: 0), "
 			"the RxM uses Shared Receive Context. This mode improves "
 			"memory consumption, but it may increase small message "
@@ -397,11 +403,21 @@ RXM_INI
 			"(default: 128). Setting this to 0 would get default "
 			"value defined by the MSG provider.");
 
+	fi_param_define(&rxm_prov, "cm_progress_interval", FI_PARAM_INT,
+			"Defines the number of microseconds to wait between "
+			"function calls to the connection management progression "
+			"functions during fi_cq_read calls. Higher values may "
+			"decrease noise during cq polling, but may result in "
+			"longer connection establishment times. (default: 10000).");
+
 	fi_param_get_size_t(&rxm_prov, "tx_size", &rxm_info.tx_attr->size);
 	fi_param_get_size_t(&rxm_prov, "rx_size", &rxm_info.rx_attr->size);
 	fi_param_get_size_t(&rxm_prov, "msg_tx_size", &rxm_msg_tx_size);
 	fi_param_get_size_t(&rxm_prov, "msg_rx_size", &rxm_msg_rx_size);
 	fi_param_get_size_t(NULL, "universe_size", &rxm_def_univ_size);
+	if (fi_param_get_int(&rxm_prov, "cm_progress_interval",
+				(int *) &rxm_cm_progress_interval))
+		rxm_cm_progress_interval = 10000;
 
 	if (rxm_init_info()) {
 		FI_WARN(&rxm_prov, FI_LOG_CORE, "Unable to initialize rxm_info\n");

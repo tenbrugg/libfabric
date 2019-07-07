@@ -51,13 +51,13 @@
 
 #define VERBS_DGRAM_RX_MODE (FI_MSG_PREFIX)
 
-#define VERBS_TX_OP_FLAGS (FI_INJECT | FI_COMPLETION | FI_TRANSMIT_COMPLETE)
-#define VERBS_TX_OP_FLAGS_IWARP (FI_INJECT | FI_COMPLETION)
+#define VERBS_TX_OP_FLAGS_IWARP (FI_INJECT | FI_INJECT_COMPLETE | FI_COMPLETION)
+#define VERBS_TX_OP_FLAGS (VERBS_TX_OP_FLAGS_IWARP | FI_TRANSMIT_COMPLETE)
 
 #define VERBS_RX_MODE (FI_RX_CQ_DATA)
 
-#define VERBS_MSG_ORDER (FI_ORDER_RAR | FI_ORDER_RAW | FI_ORDER_RAS | \
-		FI_ORDER_WAW | FI_ORDER_WAS | FI_ORDER_SAW | FI_ORDER_SAS )
+#define VERBS_MSG_ORDER (OFI_ORDER_RAR_SET | OFI_ORDER_RAW_SET | FI_ORDER_RAS | \
+		OFI_ORDER_WAW_SET | FI_ORDER_WAS | FI_ORDER_SAW | FI_ORDER_SAS )
 
 #define VERBS_INFO_NODE_2_UD_ADDR(sybsys, node, svc, ib_ud_addr)			\
 	VERBS_INFO(sybsys, "'%s:%u' resolved to <gid <interface_id=%"PRIu64		\
@@ -100,6 +100,7 @@ const struct fi_ep_attr verbs_ep_attr = {
 
 const struct fi_rx_attr verbs_rx_attr = {
 	.mode			= VERBS_RX_MODE,
+	.op_flags		= FI_COMPLETION,
 	.msg_order		= VERBS_MSG_ORDER,
 	.comp_order		= FI_ORDER_STRICT | FI_ORDER_DATA,
 	.total_buffered_recv	= 0,
@@ -107,6 +108,7 @@ const struct fi_rx_attr verbs_rx_attr = {
 
 const struct fi_rx_attr verbs_dgram_rx_attr = {
 	.mode			= VERBS_DGRAM_RX_MODE | VERBS_RX_MODE,
+	.op_flags		= FI_COMPLETION,
 	.msg_order		= VERBS_MSG_ORDER,
 	.comp_order		= FI_ORDER_STRICT | FI_ORDER_DATA,
 	.total_buffered_recv	= 0,
@@ -434,12 +436,23 @@ static inline int fi_ibv_get_qp_cap(struct ibv_context *ctx,
 
 	memset(&init_attr, 0, sizeof init_attr);
 	init_attr.send_cq = cq;
-	init_attr.cap.max_send_wr = fi_ibv_gl_data.def_tx_size;
-	init_attr.cap.max_send_sge = fi_ibv_gl_data.def_tx_iov_limit;
+
+	assert(info->tx_attr->size &&
+	       info->tx_attr->iov_limit &&
+	       info->rx_attr->size &&
+	       info->rx_attr->iov_limit);
+
+	init_attr.cap.max_send_wr = MIN(fi_ibv_gl_data.def_tx_size,
+					info->tx_attr->size);
+	init_attr.cap.max_send_sge = MIN(fi_ibv_gl_data.def_tx_iov_limit,
+					 info->tx_attr->iov_limit);
+
 	if (!fi_ibv_is_xrc_send_qp(qp_type)) {
 		init_attr.recv_cq = cq;
-		init_attr.cap.max_recv_wr = fi_ibv_gl_data.def_rx_size;
-		init_attr.cap.max_recv_sge = fi_ibv_gl_data.def_rx_iov_limit;
+		init_attr.cap.max_recv_wr = MIN(fi_ibv_gl_data.def_rx_size,
+						info->rx_attr->size);
+		init_attr.cap.max_recv_sge = MIN(fi_ibv_gl_data.def_rx_iov_limit,
+						 info->rx_attr->iov_limit);
 	}
 	init_attr.cap.max_inline_data = fi_ibv_find_max_inline(pd, ctx, qp_type);
 	init_attr.qp_type = qp_type;
@@ -598,6 +611,7 @@ static int fi_ibv_get_device_attrs(struct ibv_context *ctx,
 						  MIN(device_attr.max_qp_wr,
 						      device_attr.max_srq_wr) :
 						  device_attr.max_qp_wr;
+	// TODO set one of srq sge or regular sge based on hints?
 	info->rx_attr->iov_limit 		= device_attr.max_srq_sge ?
 						  MIN(device_attr.max_sge,
 						      device_attr.max_srq_sge) :
@@ -623,7 +637,7 @@ static int fi_ibv_get_device_attrs(struct ibv_context *ctx,
 	}
 
 	if (port_num == device_attr.phys_port_cnt + 1) {
-		VERBS_WARN(FI_LOG_FABRIC, "There are no active ports\n");
+		VERBS_INFO(FI_LOG_FABRIC, "There are no active ports\n");
 		return -FI_ENODATA;
 	} else {
 		VERBS_INFO(FI_LOG_FABRIC,

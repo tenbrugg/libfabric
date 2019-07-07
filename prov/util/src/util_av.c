@@ -322,15 +322,21 @@ int ofi_av_remove_addr(struct util_av *av, fi_addr_t fi_addr)
 	return 0;
 }
 
-fi_addr_t ofi_av_lookup_fi_addr(struct util_av *av, const void *addr)
+fi_addr_t ofi_av_lookup_fi_addr_unsafe(struct util_av *av, const void *addr)
 {
 	struct util_av_entry *entry = NULL;
 
-	fastlock_acquire(&av->lock);
 	HASH_FIND(hh, av->hash, addr, av->addrlen, entry);
-	fastlock_release(&av->lock);
-
 	return entry ? ofi_buf_index(entry) : FI_ADDR_NOTAVAIL;
+}
+
+fi_addr_t ofi_av_lookup_fi_addr(struct util_av *av, const void *addr)
+{
+	fi_addr_t fi_addr;
+	fastlock_acquire(&av->lock);
+	fi_addr = ofi_av_lookup_fi_addr_unsafe(av, addr);
+	fastlock_release(&av->lock);
+	return fi_addr;
 }
 
 static void *
@@ -348,6 +354,13 @@ int ofi_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags)
 	av = container_of(av_fid, struct util_av, av_fid.fid);
 	if (eq_fid->fclass != FI_CLASS_EQ) {
 		FI_WARN(av->prov, FI_LOG_AV, "invalid fid class\n");
+		return -FI_EINVAL;
+	}
+
+	if (!(av->flags & FI_EVENT)) {
+		FI_WARN(av->prov, FI_LOG_AV, "cannot bind EQ to an AV that was "
+			"configured for synchronous operation: FI_EVENT flag was"
+			" not specified in fi_av_attr when AV was opened\n");
 		return -FI_EINVAL;
 	}
 
@@ -377,6 +390,8 @@ int ofi_av_close_lightweight(struct util_av *av)
 
 	if (av->eq)
 		ofi_atomic_dec32(&av->eq->ref);
+
+	fastlock_destroy(&av->ep_list_lock);
 
 	ofi_atomic_dec32(&av->domain->ref);
 	fastlock_destroy(&av->lock);
@@ -416,7 +431,8 @@ static int util_av_init(struct util_av *av, const struct fi_av_attr *attr,
 		.max_cnt	= 0,
 		/* Don't use track of buffer, because user can close
 		 * the AV without prior deletion of addresses */
-		.flags		= OFI_BUFPOOL_NO_TRACK | OFI_BUFPOOL_INDEXED,
+		.flags		= OFI_BUFPOOL_NO_TRACK | OFI_BUFPOOL_INDEXED |
+				  OFI_BUFPOOL_HUGEPAGES,
 	};
 
 	/* TODO: Handle FI_READ */
@@ -496,6 +512,7 @@ int ofi_av_init_lightweight(struct util_domain *domain, const struct fi_av_attr 
 	 */
 	av->context = context;
 	av->domain = domain;
+	fastlock_init(&av->ep_list_lock);
 	dlist_init(&av->ep_list);
 	ofi_atomic_inc32(&domain->ref);
 	return 0;
